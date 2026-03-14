@@ -11,6 +11,7 @@ import (
 	"io"
 	"math/big"
 	"net"
+	"strings"
 	"time"
 
 	"www.bamsoftware.com/git/dnstt.git/dns"
@@ -61,6 +62,39 @@ var DefaultCoverDomains = []string{
 	"rubika.ir",
 	"namnak.com",
 	"tamin.ir",
+}
+
+// chineseOemInterceptedDomains are domains that Chinese OEM ROMs (MIUI,
+// HyperOS, EMUI) intercept or override DNS responses for.
+var chineseOemInterceptedDomains = map[string]bool{
+	"connectivitycheck.gstatic.com":        true,
+	"clients3.google.com":                  true,
+	"play.googleapis.com":                  true,
+	"mtalk.google.com":                     true,
+	"firebaseinstallations.googleapis.com": true,
+}
+
+// chineseOemManufacturers maps lowercase manufacturer names to true.
+var chineseOemManufacturers = map[string]bool{
+	"xiaomi": true, "redmi": true, "poco": true,
+	"huawei": true, "honor": true,
+	"oppo": true, "vivo": true, "realme": true, "oneplus": true,
+	"meizu": true, "zte": true, "lenovo": true,
+}
+
+// filterCoverDomains removes intercepted domains for Chinese OEM devices.
+func filterCoverDomains(domains []string, manufacturer string) []string {
+	mfr := strings.ToLower(strings.TrimSpace(manufacturer))
+	if mfr == "" || !chineseOemManufacturers[mfr] {
+		return domains
+	}
+	var filtered []string
+	for _, d := range domains {
+		if !chineseOemInterceptedDomains[d] {
+			filtered = append(filtered, d)
+		}
+	}
+	return filtered
 }
 
 // noizCDNPrefixes are multi-level fake labels prepended to queries to make the
@@ -192,7 +226,7 @@ func makeSendFunc(clientID turbotunnel.ClientID, domain dns.Name, cdnAlways bool
 			{
 				Name:  dns.Name{},
 				Type:  dns.RRTypeOPT,
-				Class: 1232,
+				Class: 4096, // requester's UDP payload size — match upstream dnstt; server caps actual response
 				TTL:   0,
 				Data:  []byte{},
 			},
@@ -294,21 +328,23 @@ func DnsNameCapacityNoiz(domain dns.Name) int {
 // NewNoizDNSPacketConn creates a new DNSPacketConn with NoizDNS evasion
 // features enabled: hex encoding, variable-length labels, CDN prefix
 // camouflage, and cover traffic. Stealth mode is off.
-func NewNoizDNSPacketConn(transport net.PacketConn, addr net.Addr, domain dns.Name, config *dnsttclient.DNSPacketConnConfig) *dnsttclient.DNSPacketConn {
-	return newNoizConn(transport, addr, domain, config, false)
+// deviceManufacturer filters cover domains that Chinese OEM ROMs intercept.
+func NewNoizDNSPacketConn(transport net.PacketConn, addr net.Addr, domain dns.Name, config *dnsttclient.DNSPacketConnConfig, deviceManufacturer string) *dnsttclient.DNSPacketConn {
+	return newNoizConn(transport, addr, domain, config, false, deviceManufacturer)
 }
 
 // NewNoizDNSPacketConnStealth creates a NoizDNS DNSPacketConn with stealth
 // mode enabled: 100% CDN prefix on all queries, aggressive cover traffic
 // (3-8s interval instead of 5-15s), and slower KCP polling.
 // Reduces throughput but makes traffic much harder for DPI to fingerprint.
-func NewNoizDNSPacketConnStealth(transport net.PacketConn, addr net.Addr, domain dns.Name, config *dnsttclient.DNSPacketConnConfig) *dnsttclient.DNSPacketConn {
-	return newNoizConn(transport, addr, domain, config, true)
+// deviceManufacturer filters cover domains that Chinese OEM ROMs intercept.
+func NewNoizDNSPacketConnStealth(transport net.PacketConn, addr net.Addr, domain dns.Name, config *dnsttclient.DNSPacketConnConfig, deviceManufacturer string) *dnsttclient.DNSPacketConn {
+	return newNoizConn(transport, addr, domain, config, true, deviceManufacturer)
 }
 
-func newNoizConn(transport net.PacketConn, addr net.Addr, domain dns.Name, config *dnsttclient.DNSPacketConnConfig, stealth bool) *dnsttclient.DNSPacketConn {
+func newNoizConn(transport net.PacketConn, addr net.Addr, domain dns.Name, config *dnsttclient.DNSPacketConnConfig, stealth bool, deviceManufacturer string) *dnsttclient.DNSPacketConn {
 	clientID := turbotunnel.NewClientID()
-	coverDomains := DefaultCoverDomains
+	coverDomains := filterCoverDomains(DefaultCoverDomains, deviceManufacturer)
 
 	hooks := &dnsttclient.DNSPacketConnHooks{
 		CustomSendFunc: makeSendFunc(clientID, domain, stealth),

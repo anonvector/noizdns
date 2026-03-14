@@ -66,6 +66,16 @@ type DnsttClient struct {
 	// less conspicuous DNS queries at the cost of throughput.
 	maxPayload int
 
+	// utlsDistribution overrides the default uTLS fingerprint distribution.
+	// Empty string = use default. "none" = disable uTLS.
+	// Single value (e.g. "Chrome_120") = use that exact fingerprint every time.
+	// Weighted (e.g. "3*Chrome_120,1*Firefox_120") = random from distribution.
+	utlsDistribution string
+
+	// deviceManufacturer is passed to NoizDNS so cover traffic can skip
+	// domains that Chinese OEM ROMs (MIUI, EMUI) intercept.
+	deviceManufacturer string
+
 	mu            sync.Mutex
 	running       bool
 	cancel        context.CancelFunc
@@ -144,6 +154,24 @@ func (c *DnsttClient) SetMaxPayload(size int) {
 	c.maxPayload = size
 }
 
+// SetUTLSFingerprint overrides the uTLS fingerprint selection.
+// Accepts a single fingerprint name (e.g. "Chrome_120", "Firefox_120", "iOS_14",
+// "random") for a fixed fingerprint every run, or a weighted distribution
+// (e.g. "3*Chrome_120,1*Firefox_120") for random selection.
+// "none" disables uTLS entirely.
+// Empty string uses the default random distribution.
+// Must be called before Start.
+func (c *DnsttClient) SetUTLSFingerprint(fingerprint string) {
+	c.utlsDistribution = fingerprint
+}
+
+// SetDeviceManufacturer provides the device manufacturer string (e.g. "Xiaomi")
+// so NoizDNS can filter cover domains that Chinese OEM ROMs intercept.
+// Must be called before Start.
+func (c *DnsttClient) SetDeviceManufacturer(manufacturer string) {
+	c.deviceManufacturer = manufacturer
+}
+
 // Start begins the DNSTT tunnel in a background goroutine.
 func (c *DnsttClient) Start() error {
 	c.mu.Lock()
@@ -164,7 +192,11 @@ func (c *DnsttClient) Start() error {
 	}
 
 	// Sample uTLS fingerprint.
-	utlsID, err := dnsttclient.SampleUTLSDistribution(defaultUTLSDistribution)
+	utlsDist := defaultUTLSDistribution
+	if c.utlsDistribution != "" {
+		utlsDist = c.utlsDistribution
+	}
+	utlsID, err := dnsttclient.SampleUTLSDistribution(utlsDist)
 	if err != nil {
 		cancel()
 		return fmt.Errorf("sampling uTLS distribution: %v", err)
@@ -360,9 +392,9 @@ func (c *DnsttClient) Start() error {
 		dnsConfig = &dnsttclient.DNSPacketConnConfig{PollLimit: 8}
 	}
 	if c.noizMode && c.stealthMode {
-		pconn = noizdns.NewNoizDNSPacketConnStealth(pconn, remoteAddr, domain, dnsConfig)
+		pconn = noizdns.NewNoizDNSPacketConnStealth(pconn, remoteAddr, domain, dnsConfig, c.deviceManufacturer)
 	} else if c.noizMode {
-		pconn = noizdns.NewNoizDNSPacketConn(pconn, remoteAddr, domain, dnsConfig)
+		pconn = noizdns.NewNoizDNSPacketConn(pconn, remoteAddr, domain, dnsConfig, c.deviceManufacturer)
 	} else {
 		pconn = dnsttclient.NewDNSPacketConnWithConfig(pconn, remoteAddr, domain, dnsConfig)
 	}
