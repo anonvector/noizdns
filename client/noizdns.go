@@ -101,6 +101,14 @@ var chineseOemInterceptedDomains = map[string]bool{
 	"play.googleapis.com":                  true,
 	"mtalk.google.com":                     true,
 	"firebaseinstallations.googleapis.com": true,
+	// Chrome infra domains intercepted by Chinese OEM ROMs
+	"clients1.google.com":         true,
+	"clients2.google.com":         true,
+	"update.googleapis.com":       true,
+	"accounts.google.com":         true,
+	"translate.googleapis.com":    true,
+	"www.google-analytics.com":    true,
+	"pagead2.googlesyndication.com": true,
 }
 
 // chineseOemManufacturers maps lowercase manufacturer names to true.
@@ -353,7 +361,7 @@ func sendCoverQuery(transport net.PacketConn, addr net.Addr, domain string, qtyp
 // Chrome resolves all resources for a page in a rapid burst: primary domain
 // (A + AAAA + sometimes HTTPS), then 3-10 sub-resource lookups for CDNs,
 // analytics, fonts, etc. The burst completes in 100-500ms, then silence.
-func simulatePageLoad(coverDomains []string, transport net.PacketConn, addr net.Addr) {
+func simulatePageLoad(coverDomains, bgDomains, chromeDomains []string, transport net.PacketConn, addr net.Addr) {
 	primary := pickRandom(coverDomains)
 
 	// Chrome always sends A + AAAA for the primary domain
@@ -379,9 +387,9 @@ func simulatePageLoad(coverDomains []string, transport net.PacketConn, addr net.
 		case r < 5: // 50% browsing domains
 			domain = pickRandom(coverDomains)
 		case r < 8: // 30% background/CDN domains
-			domain = pickRandom(backgroundDomains)
+			domain = pickRandom(bgDomains)
 		default: // 20% Chrome infra
-			domain = pickRandom(chromeInfraDomains)
+			domain = pickRandom(chromeDomains)
 		}
 
 		sendCoverQuery(transport, addr, domain, dns.RRTypeA)
@@ -396,10 +404,10 @@ func simulatePageLoad(coverDomains []string, transport net.PacketConn, addr net.
 
 // simulateChromeBackground sends 1-3 Chrome infra queries (Safe Browsing,
 // update checks, predictor pre-resolve) with 50-500ms spacing.
-func simulateChromeBackground(transport net.PacketConn, addr net.Addr) {
+func simulateChromeBackground(chromeDomains []string, transport net.PacketConn, addr net.Addr) {
 	count := 1 + randInt(3)
 	for i := 0; i < count; i++ {
-		domain := pickRandom(chromeInfraDomains)
+		domain := pickRandom(chromeDomains)
 		sendCoverQuery(transport, addr, domain, dns.RRTypeA)
 		sleepRandMs(50, 500)
 	}
@@ -415,11 +423,11 @@ func simulateChromeBackground(transport net.PacketConn, addr net.Addr) {
 //
 // pageLoadInterval controls the average seconds between page-load bursts.
 // bgInterval controls the average seconds between background queries.
-func coverTrafficLoop(coverDomains []string, transport net.PacketConn, addr net.Addr, pageLoadInterval, bgInterval time.Duration) {
+func coverTrafficLoop(coverDomains, bgDomains, chromeDomains []string, transport net.PacketConn, addr net.Addr, pageLoadInterval, bgInterval time.Duration) {
 	// Chrome startup burst: resolve infra domains on "launch"
 	count := 3 + randInt(3)
 	for i := 0; i < count; i++ {
-		domain := pickRandom(chromeInfraDomains)
+		domain := pickRandom(chromeDomains)
 		sendCoverQuery(transport, addr, domain, dns.RRTypeA)
 		sleepRandMs(5, 30)
 	}
@@ -435,7 +443,7 @@ func coverTrafficLoop(coverDomains []string, transport net.PacketConn, addr net.
 
 	for {
 		// Simulate a page-load burst
-		simulatePageLoad(coverDomains, transport, addr)
+		simulatePageLoad(coverDomains, bgDomains, chromeDomains, transport, addr)
 
 		// Inter-burst silence with jitter (0.5x - 2.0x of base interval)
 		var jb [1]byte
@@ -461,7 +469,7 @@ func coverTrafficLoop(coverDomains []string, transport net.PacketConn, addr net.
 
 			// ~30% chance of background activity per chunk
 			if randBool(0.3) {
-				simulateChromeBackground(transport, addr)
+				simulateChromeBackground(chromeDomains, transport, addr)
 			}
 		}
 	}
@@ -510,6 +518,8 @@ func NewNoizDNSPacketConnStealth(transport net.PacketConn, addr net.Addr, domain
 func newNoizConn(transport net.PacketConn, addr net.Addr, domain dns.Name, config *dnsttclient.DNSPacketConnConfig, stealth bool, deviceManufacturer string) *dnsttclient.DNSPacketConn {
 	clientID := turbotunnel.NewClientID()
 	coverDomains := filterCoverDomains(DefaultCoverDomains, deviceManufacturer)
+	filteredChrome := filterCoverDomains(chromeInfraDomains, deviceManufacturer)
+	filteredBackground := filterCoverDomains(backgroundDomains, deviceManufacturer)
 
 	hooks := &dnsttclient.DNSPacketConnHooks{
 		CustomSendFunc: makeSendFunc(clientID, domain, stealth),
@@ -535,7 +545,7 @@ func newNoizConn(transport net.PacketConn, addr net.Addr, domain dns.Name, confi
 			bgInterval = 10 * time.Second
 		}
 		hooks.OnStart = func(transport net.PacketConn, addr net.Addr) {
-			go coverTrafficLoop(coverDomains, transport, addr, pageLoadInterval, bgInterval)
+			go coverTrafficLoop(coverDomains, filteredBackground, filteredChrome, transport, addr, pageLoadInterval, bgInterval)
 		}
 	}
 
