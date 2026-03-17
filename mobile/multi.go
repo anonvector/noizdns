@@ -4,7 +4,6 @@ import (
 	"log"
 	"net"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -36,7 +35,6 @@ type resolverState struct {
 type resolverTracker struct {
 	mu       sync.Mutex
 	states   []resolverState
-	rrIndex  uint64 // round-robin counter (atomic)
 	stopCh   chan struct{}
 	stopOnce sync.Once
 }
@@ -58,36 +56,35 @@ func newResolverTracker(n int) *resolverTracker {
 	return t
 }
 
-// pickBest selects one resolver index. It first checks for a dead resolver
-// that is due for a probe (to discover recovery). Otherwise it round-robins
-// among alive resolvers. If all are dead, it round-robins among all.
-func (t *resolverTracker) pickBest() int {
+// pickAlive returns all alive resolver indices plus any dead resolver that is
+// due for a probe (to discover recovery). If all resolvers are dead and none
+// are due for a probe, it returns all indices as a fallback.
+func (t *resolverTracker) pickAlive() []int {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
 	now := time.Now()
 	n := len(t.states)
 
-	// Phase 1: look for a dead resolver due for a probe.
+	alive := make([]int, 0, n)
 	for i := 0; i < n; i++ {
-		s := &t.states[i]
-		if !s.alive && now.Sub(s.lastProbe) >= probeInterval {
-			s.lastProbe = now
-			return i
+		if t.states[i].alive {
+			alive = append(alive, i)
+		} else if now.Sub(t.states[i].lastProbe) >= probeInterval {
+			// Dead resolver due for a probe — include it.
+			t.states[i].lastProbe = now
+			alive = append(alive, i)
 		}
 	}
 
-	// Phase 2: round-robin among alive resolvers.
-	start := int(atomic.AddUint64(&t.rrIndex, 1) - 1)
-	for i := 0; i < n; i++ {
-		idx := (start + i) % n
-		if t.states[idx].alive {
-			return idx
+	// Fallback: all dead — return all indices (KCP handles retransmission).
+	if len(alive) == 0 {
+		alive = make([]int, n)
+		for i := range alive {
+			alive[i] = i
 		}
 	}
-
-	// Phase 3: all dead — round-robin among all (KCP handles retransmission).
-	return start % n
+	return alive
 }
 
 func (t *resolverTracker) markSent(idx int) {
@@ -169,9 +166,9 @@ func (t *resolverTracker) close() {
 // SmartUDPConn — replaces BroadcastUDPConn
 // ---------------------------------------------------------------------------
 
-// SmartUDPConn wraps a single UDP socket and routes each query to ONE resolver
-// via health-tracking round-robin. Dead resolvers are periodically probed for
-// recovery.
+// SmartUDPConn wraps a single UDP socket and fans out each query to ALL alive
+// resolvers simultaneously. KCP deduplicates responses, so the fastest reply
+// wins. Dead resolvers are periodically probed for recovery.
 type SmartUDPConn struct {
 	conn    *net.UDPConn
 	addrs   []*net.UDPAddr
@@ -198,9 +195,23 @@ func NewSmartUDPConn(addrs []*net.UDPAddr) (*SmartUDPConn, error) {
 }
 
 func (s *SmartUDPConn) WriteTo(p []byte, _ net.Addr) (int, error) {
-	idx := s.tracker.pickBest()
-	s.tracker.markSent(idx)
-	return s.conn.WriteTo(p, s.addrs[idx])
+	targets := s.tracker.pickAlive()
+	var lastN int
+	var lastErr error
+	for _, idx := range targets {
+		s.tracker.markSent(idx)
+		n, err := s.conn.WriteTo(p, s.addrs[idx])
+		if err != nil {
+			lastErr = err
+		} else {
+			lastN = n
+			lastErr = nil
+		}
+	}
+	if lastErr == nil {
+		return lastN, nil
+	}
+	return 0, lastErr
 }
 
 func (s *SmartUDPConn) ReadFrom(p []byte) (int, net.Addr, error) {
@@ -251,14 +262,15 @@ type recvMsg struct {
 }
 
 // SmartMultiPacketConn multiplexes across multiple net.PacketConn transports
-// (for DoT). It routes each write to ONE transport via health-tracking
-// round-robin and aggregates reads via a shared channel.
+// (for DoT). It fans out each write to ALL alive transports simultaneously
+// and aggregates reads via a shared channel. KCP deduplicates responses.
 type SmartMultiPacketConn struct {
 	transports []net.PacketConn
 	addrs      []net.Addr
 	recvCh     chan recvMsg
 	closeCh    chan struct{}
 	closeOnce  sync.Once
+	recvWg     sync.WaitGroup
 	tracker    *resolverTracker
 }
 
@@ -270,6 +282,7 @@ func NewSmartMultiPacketConn(transports []net.PacketConn, addrs []net.Addr) *Sma
 		closeCh:    make(chan struct{}),
 		tracker:    newResolverTracker(len(transports)),
 	}
+	m.recvWg.Add(len(transports))
 	for i, t := range transports {
 		go m.recvLoop(i, t)
 	}
@@ -277,6 +290,7 @@ func NewSmartMultiPacketConn(transports []net.PacketConn, addrs []net.Addr) *Sma
 }
 
 func (m *SmartMultiPacketConn) recvLoop(idx int, transport net.PacketConn) {
+	defer m.recvWg.Done()
 	for {
 		buf := make([]byte, 4096)
 		n, addr, err := transport.ReadFrom(buf)
@@ -304,28 +318,37 @@ func (m *SmartMultiPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
 }
 
 func (m *SmartMultiPacketConn) WriteTo(p []byte, _ net.Addr) (int, error) {
-	idx := m.tracker.pickBest()
-	m.tracker.markSent(idx)
-	n, err := m.transports[idx].WriteTo(p, m.addrs[idx])
-	if err != nil {
-		m.tracker.markDead(idx)
-		// Retry once with the next best resolver.
-		idx2 := m.tracker.pickBest()
-		if idx2 != idx {
-			m.tracker.markSent(idx2)
-			return m.transports[idx2].WriteTo(p, m.addrs[idx2])
+	targets := m.tracker.pickAlive()
+	var lastN int
+	var lastErr error
+	for _, idx := range targets {
+		m.tracker.markSent(idx)
+		n, err := m.transports[idx].WriteTo(p, m.addrs[idx])
+		if err != nil {
+			m.tracker.markDead(idx)
+			lastErr = err
+		} else {
+			lastN = n
+			lastErr = nil
 		}
 	}
-	return n, err
+	if lastErr == nil {
+		return lastN, nil
+	}
+	return 0, lastErr
 }
 
 func (m *SmartMultiPacketConn) Close() error {
 	m.closeOnce.Do(func() {
 		m.tracker.close()
 		close(m.closeCh)
+		// Close transports first so recvLoop's ReadFrom unblocks and exits.
 		for _, t := range m.transports {
 			t.Close()
 		}
+		// Wait for all recvLoops to exit before closing the channel,
+		// preventing a send-on-closed-channel panic.
+		m.recvWg.Wait()
 		close(m.recvCh)
 	})
 	return nil

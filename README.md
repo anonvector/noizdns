@@ -4,6 +4,10 @@ DPI-evasion layer built on top of [dnstt](https://www.bamsoftware.com/software/d
 
 The server auto-detects base36 (NoizDNS v2), hex (NoizDNS v1), and base32 (standard dnstt) clients simultaneously through a single endpoint.
 
+## License
+
+MIT — see [LICENSE](LICENSE).
+
 ## Features
 
 ### Base36 Encoding
@@ -29,11 +33,22 @@ Example query:
 img-cache.us-east-1.k7m2x9nq4wp5zt8rj3hv6bc.y1da0fu8l5onge.t.example.com
 ```
 
-### Cover Traffic
-- Sends periodic legitimate DNS A queries to real domains
-- Dilutes tunnel-to-total DNS ratio for statistical evasion
-- Normal: 5-15s intervals, Stealth: 3-8s intervals
-- Default domains: connectivitycheck.gstatic.com, clients3.google.com, play.googleapis.com, mtalk.google.com, captive.apple.com, graph.facebook.com, api.whatsapp.com, push.apple.com, google.com, microsoft.com
+### Cover Traffic with Page-Load Bursts
+- Sends cover queries in **bursts** that mimic Chrome page loads, not steady drip
+- Each burst: 5-15 queries in 100-500ms (A + AAAA + HTTPS for primary domain, then sub-resource lookups), then silence
+- Three domain pools: browsing domains (50%), CDN/analytics (30%), Chrome infra (20%)
+- Chrome startup burst on tunnel init (3-5 infra domain queries)
+- Background Chrome activity between bursts (Safe Browsing, update checks, ~30% chance per interval)
+- Mixes international platform domains with domestic domains reachable during internet shutdowns
+- Auto-filters domains intercepted by Chinese OEM ROMs (Xiaomi, Huawei, etc.)
+- Normal: ~15s between page-load bursts, Stealth: ~5s between bursts
+
+### Chrome-like DNS Fingerprint
+- EDNS0 UDP payload size set to 1452 (matches Chrome)
+- AD=1 (Authenticated Data) flag set on all queries (Chrome default since ~2020)
+- HTTPS record type (65) queries mixed in (~60% of page loads, Chrome default since ~2022)
+- A + AAAA query pairs (~80% of lookups, matching Chrome dual-stack behavior)
+- Applied to both tunnel queries and cover traffic for consistency
 
 ### Stealth Mode
 Trades throughput for maximum DPI resistance:
@@ -88,7 +103,8 @@ Why this works:
 | ACK NoDelay | yes | yes | no | no |
 | Max Streams | unlimited | 20 | 16 | 32 |
 | CDN Prefix | N/A | 25% | 100% | N/A |
-| Cover Traffic | N/A | 5-15s | 3-8s | N/A |
+| Cover Bursts | N/A | ~15s apart | ~5s apart | N/A |
+| Background | N/A | ~45s | ~10s | N/A |
 
 ## Transport Support
 
@@ -215,7 +231,7 @@ Upstream (client → server):
         ↓
   Append tunnel domain
         ↓
-  DNS TXT query with EDNS0 (1232 byte payload)
+  DNS TXT query with EDNS0 (1452 byte UDP size, AD=1)
 ```
 
 ## Capacity
