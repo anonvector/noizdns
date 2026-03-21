@@ -43,12 +43,11 @@ img-cache.us-east-1.k7m2x9nq4wp5zt8rj3hv6bc.y1da0fu8l5onge.t.example.com
 - Auto-filters domains intercepted by Chinese OEM ROMs (Xiaomi, Huawei, etc.)
 - Normal: ~15s between page-load bursts, Stealth: ~5s between bursts
 
-### Chrome-like DNS Fingerprint
-- EDNS0 UDP payload size set to 1452 (matches Chrome)
-- AD=1 (Authenticated Data) flag set on all queries (Chrome default since ~2020)
+### Chrome-like DNS Fingerprint (cover traffic only)
+- EDNS0 UDP payload size 1452 and AD=1 flag on cover traffic queries (matches Chrome)
 - HTTPS record type (65) queries mixed in (~60% of page loads, Chrome default since ~2022)
 - A + AAAA query pairs (~80% of lookups, matching Chrome dual-stack behavior)
-- Applied to both tunnel queries and cover traffic for consistency
+- Tunnel queries use standard EDNS0 4096 and RD=1 for maximum resolver compatibility
 
 ### Stealth Mode
 Trades throughput for maximum DPI resistance:
@@ -237,7 +236,7 @@ Upstream (client → server):
         ↓
   Append tunnel domain
         ↓
-  DNS TXT query with EDNS0 (1452 byte UDP size, AD=1)
+  DNS TXT query with EDNS0 (4096 byte UDP size, RD=1)
 ```
 
 ## Capacity
