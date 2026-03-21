@@ -39,6 +39,16 @@ const DefaultJitterMax = 0
 // Chrome sends these since ~2022 for HTTPS-capable domains.
 const rrTypeHTTPS = 65
 
+// QueryPadding enables random EDNS0 padding (RFC 7830) on every tunnel query,
+// adding 0–QueryPaddingMax random bytes to vary the wire size. Use together
+// with --query-size to keep queries small AND randomly sized.
+// No server changes required; the server ignores EDNS0 padding.
+var QueryPadding = false
+
+// QueryPaddingMax is the maximum number of random padding bytes added per
+// query when QueryPadding is enabled. Default 20 gives a 20-byte size window.
+var QueryPaddingMax = 20
+
 // DefaultCoverDomains are real domains queried as cover traffic.
 // Mixes international platform domains (Android/iOS background traffic)
 // with domestic domains reachable during internet shutdowns.
@@ -273,9 +283,32 @@ func makeSendFunc(clientID turbotunnel.ClientID, domain dns.Name, cdnAlways bool
 			return err
 		}
 
+		if QueryPadding && QueryPaddingMax > 0 {
+			buf = addEDNS0Padding(buf, randInt(QueryPaddingMax+1))
+		}
+
 		_, err = transport.WriteTo(buf, addr)
 		return err
 	}
+}
+
+// addEDNS0Padding appends an EDNS0 Padding option (RFC 7830, option code 12)
+// with padLen zero bytes to the OPT record at the end of a DNS wire message.
+// The OPT record must be the last record with empty RDATA (as built above).
+func addEDNS0Padding(buf []byte, padLen int) []byte {
+	if padLen <= 0 {
+		return buf
+	}
+	// OPT RDATA sits at end of message. For empty Data, RDLENGTH is the
+	// last 2 bytes of the current buffer. Update it to include the new option.
+	rdLenOffset := len(buf) - 2
+	old := binary.BigEndian.Uint16(buf[rdLenOffset : rdLenOffset+2])
+	binary.BigEndian.PutUint16(buf[rdLenOffset:rdLenOffset+2], old+uint16(4+padLen))
+	// Append option: code=12, length=padLen, then padLen zero bytes.
+	opt := make([]byte, 4+padLen)
+	binary.BigEndian.PutUint16(opt[0:2], 12)
+	binary.BigEndian.PutUint16(opt[2:4], uint16(padLen))
+	return append(buf, opt...)
 }
 
 // makeJitterHook returns a PreSendHook that adds random jitter between

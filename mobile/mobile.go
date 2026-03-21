@@ -18,6 +18,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -25,6 +26,8 @@ import (
 	utls "github.com/refraction-networking/utls"
 	"github.com/xtaci/kcp-go/v5"
 	"github.com/xtaci/smux"
+	"golang.org/x/net/http2"
+	"golang.org/x/net/proxy"
 	noizdns "noizdns/client"
 	"www.bamsoftware.com/git/dnstt.git/dns"
 	dnsttclient "www.bamsoftware.com/git/dnstt.git/dnstt-client/lib"
@@ -75,6 +78,21 @@ type DnsttClient struct {
 	// deviceManufacturer is passed to NoizDNS so cover traffic can skip
 	// domains that Chinese OEM ROMs (MIUI, EMUI) intercept.
 	deviceManufacturer string
+
+	// socksUser/socksPass are injected automatically during the SOCKS5
+	// handshake so clients (browsers, curl) never need to provide credentials.
+	socksUser string
+	socksPass string
+
+	// queryPaddingMax sets the max EDNS0 padding bytes per query (0 = disabled).
+	queryPaddingMax int
+
+	// socksProxyAddr is the upstream SOCKS5 proxy address ("host:port") to route
+	// DNS transport connections through. Empty = direct connection (default).
+	// Used when DNSTT is a chain layer behind another proxy (e.g., SSH → DNSTT).
+	socksProxyAddr string
+	socksProxyUser string
+	socksProxyPass string
 
 	mu            sync.Mutex
 	running       bool
@@ -172,6 +190,45 @@ func (c *DnsttClient) SetDeviceManufacturer(manufacturer string) {
 	c.deviceManufacturer = manufacturer
 }
 
+// SetQueryPadding enables random EDNS0 padding (RFC 7830) on every tunnel
+// query, adding 0–maxBytes random bytes to vary the wire size.
+// Must be called before Start.
+func (c *DnsttClient) SetQueryPadding(maxBytes int) {
+	c.queryPaddingMax = maxBytes
+}
+
+// SetSocksCredentials sets the SOCKS5 username and password to inject
+// automatically during the handshake. Clients (browsers, curl) connect
+// to the local proxy without credentials; the CLI handles auth transparently.
+// Must be called before Start.
+func (c *DnsttClient) SetSocksCredentials(user, pass string) {
+	c.socksUser = user
+	c.socksPass = pass
+}
+
+// SetSOCKS5Proxy configures an upstream SOCKS5 proxy for DNS transport
+// connections. When set, all DNS queries (DoH/DoT/TCP) will be routed through
+// the proxy. UDP transport is auto-promoted to TCP since SOCKS5 is TCP-only.
+// Must be called before Start.
+func (c *DnsttClient) SetSOCKS5Proxy(addr, username, password string) {
+	c.socksProxyAddr = addr
+	c.socksProxyUser = username
+	c.socksProxyPass = password
+}
+
+// socksDialer returns a proxy.Dialer configured for the upstream SOCKS5 proxy,
+// or proxy.Direct if no proxy is configured.
+func (c *DnsttClient) socksDialer() (proxy.Dialer, error) {
+	if c.socksProxyAddr == "" {
+		return proxy.Direct, nil
+	}
+	var auth *proxy.Auth
+	if c.socksProxyUser != "" {
+		auth = &proxy.Auth{User: c.socksProxyUser, Password: c.socksProxyPass}
+	}
+	return proxy.SOCKS5("tcp", c.socksProxyAddr, auth, proxy.Direct)
+}
+
 // Start begins the DNSTT tunnel in a background goroutine.
 func (c *DnsttClient) Start() error {
 	c.mu.Lock()
@@ -217,9 +274,33 @@ func (c *DnsttClient) Start() error {
 		if utlsID == nil {
 			transport := http.DefaultTransport.(*http.Transport).Clone()
 			transport.Proxy = nil
+			if c.socksProxyAddr != "" {
+				baseDialer, dErr := c.socksDialer()
+				if dErr != nil {
+					cancel()
+					return fmt.Errorf("creating SOCKS5 dialer for DoH: %v", dErr)
+				}
+				transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+					return proxyDial(ctx, baseDialer, network, addr)
+				}
+				log.Printf("DoH: routing through SOCKS5 proxy %s", c.socksProxyAddr)
+			}
 			rt = transport
 		} else {
-			rt = dnsttclient.NewUTLSRoundTripper(nil, utlsID)
+			if c.socksProxyAddr != "" {
+				baseDialer, dErr := c.socksDialer()
+				if dErr != nil {
+					cancel()
+					return fmt.Errorf("creating SOCKS5 dialer for DoH+uTLS: %v", dErr)
+				}
+				rt = &socks5UTLSRoundTripper{
+					clientHelloID: utlsID,
+					baseDialer:    baseDialer,
+				}
+				log.Printf("DoH+uTLS: routing through SOCKS5 proxy %s", c.socksProxyAddr)
+			} else {
+				rt = dnsttclient.NewUTLSRoundTripper(nil, utlsID)
+			}
 		}
 		numSenders := 8
 		var httpConfig *dnsttclient.HTTPPacketConnConfig
@@ -243,10 +324,40 @@ func (c *DnsttClient) Start() error {
 		// May be comma-separated for multi-resolver (e.g. "tls://1.1.1.1:853,tls://8.8.8.8:853").
 		var dialTLSContext func(ctx context.Context, network, addr string) (net.Conn, error)
 		if utlsID == nil {
-			dialTLSContext = (&tls.Dialer{}).DialContext
+			if c.socksProxyAddr != "" {
+				baseDialer, dErr := c.socksDialer()
+				if dErr != nil {
+					cancel()
+					return fmt.Errorf("creating SOCKS5 dialer for DoT: %v", dErr)
+				}
+				dialTLSContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+					conn, cErr := proxyDial(ctx, baseDialer, "tcp", addr)
+					if cErr != nil {
+						return nil, cErr
+					}
+					host, _, _ := net.SplitHostPort(addr)
+					tlsConn := tls.Client(conn, &tls.Config{ServerName: host})
+					if hErr := tlsConn.HandshakeContext(ctx); hErr != nil {
+						conn.Close()
+						return nil, hErr
+					}
+					return tlsConn, nil
+				}
+				log.Printf("DoT: routing through SOCKS5 proxy %s", c.socksProxyAddr)
+			} else {
+				dialTLSContext = (&tls.Dialer{}).DialContext
+			}
 		} else {
+			baseDialer, dErr := c.socksDialer()
+			if dErr != nil {
+				cancel()
+				return fmt.Errorf("creating SOCKS5 dialer for DoT+uTLS: %v", dErr)
+			}
+			if c.socksProxyAddr != "" {
+				log.Printf("DoT+uTLS: routing through SOCKS5 proxy %s", c.socksProxyAddr)
+			}
 			dialTLSContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-				return utlsDialContext(ctx, network, addr, nil, utlsID)
+				return utlsDialContext(ctx, network, addr, nil, utlsID, baseDialer)
 			}
 		}
 
@@ -286,8 +397,21 @@ func (c *DnsttClient) Start() error {
 		// Plain TCP DNS — same 2-byte length framing as DoT but without TLS.
 		// May be comma-separated for multi-resolver (e.g. "tcp://1.1.1.1:53,tcp://8.8.8.8:53").
 		// Hostnames are resolved by Go's net.Dialer (e.g. "tcp://dns.google:53").
-		dialTCPContext := func(ctx context.Context, network, addr string) (net.Conn, error) {
-			return (&net.Dialer{}).DialContext(ctx, "tcp", addr)
+		var dialTCPContext func(ctx context.Context, network, addr string) (net.Conn, error)
+		if c.socksProxyAddr != "" {
+			baseDialer, dErr := c.socksDialer()
+			if dErr != nil {
+				cancel()
+				return fmt.Errorf("creating SOCKS5 dialer for TCP: %v", dErr)
+			}
+			dialTCPContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return proxyDial(ctx, baseDialer, "tcp", addr)
+			}
+			log.Printf("TCP: routing through SOCKS5 proxy %s", c.socksProxyAddr)
+		} else {
+			dialTCPContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return (&net.Dialer{}).DialContext(ctx, "tcp", addr)
+			}
 		}
 
 		addrs := strings.Split(c.dnsAddr, ",")
@@ -321,38 +445,82 @@ func (c *DnsttClient) Start() error {
 
 	default:
 		// Plain UDP — may be comma-separated for multi-resolver.
-		addrs := strings.Split(c.dnsAddr, ",")
-		if len(addrs) == 1 {
-			// Single resolver — original behavior, no wrapping.
-			remoteAddr, err = net.ResolveUDPAddr("udp", strings.TrimSpace(addrs[0]))
-			if err != nil {
+		if c.socksProxyAddr != "" {
+			// Auto-promote UDP to TCP — SOCKS5 is TCP-only.
+			// All DNS resolvers accept TCP on port 53 (RFC 7766).
+			log.Printf("auto-promoting UDP to TCP: SOCKS5 proxy requires TCP transport")
+			baseDialer, dErr := c.socksDialer()
+			if dErr != nil {
 				cancel()
-				return fmt.Errorf("resolving UDP address: %v", err)
+				return fmt.Errorf("creating SOCKS5 dialer for UDP→TCP promotion: %v", dErr)
 			}
-			pconn, err = net.ListenUDP("udp", nil)
-			if err != nil {
-				cancel()
-				return fmt.Errorf("opening UDP socket: %v", err)
+			dialTCPContext := func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return proxyDial(ctx, baseDialer, "tcp", addr)
 			}
-		} else {
-			// Multiple resolvers — broadcast every query to all, first response wins.
-			var udpAddrs []*net.UDPAddr
-			for _, a := range addrs {
-				addr, rErr := net.ResolveUDPAddr("udp", strings.TrimSpace(a))
-				if rErr != nil {
+			log.Printf("routing DNS through SOCKS5 proxy %s", c.socksProxyAddr)
+
+			addrs := strings.Split(c.dnsAddr, ",")
+			if len(addrs) == 1 {
+				tcpAddr := strings.TrimSpace(addrs[0])
+				pconn, err = dnsttclient.NewTLSPacketConn(tcpAddr, dialTCPContext)
+				if err != nil {
 					cancel()
-					return fmt.Errorf("resolving UDP address %s: %v", a, rErr)
+					return fmt.Errorf("creating TCP transport (promoted from UDP): %v", err)
 				}
-				udpAddrs = append(udpAddrs, addr)
+			} else {
+				var transports []net.PacketConn
+				var tAddrs []net.Addr
+				for _, a := range addrs {
+					tcpAddr := strings.TrimSpace(a)
+					t, tErr := dnsttclient.NewTLSPacketConn(tcpAddr, dialTCPContext)
+					if tErr != nil {
+						for _, prev := range transports {
+							prev.Close()
+						}
+						cancel()
+						return fmt.Errorf("creating TCP transport for %s (promoted from UDP): %v", tcpAddr, tErr)
+					}
+					transports = append(transports, t)
+					tAddrs = append(tAddrs, turbotunnel.DummyAddr{})
+				}
+				pconn = NewSmartMultiPacketConn(transports, tAddrs)
+				log.Printf("multi-resolver TCP (promoted from UDP): %d transports (smart)", len(transports))
 			}
-			sconn, sErr := NewSmartUDPConn(udpAddrs)
-			if sErr != nil {
-				cancel()
-				return fmt.Errorf("opening UDP socket: %v", sErr)
-			}
-			pconn = sconn
 			remoteAddr = turbotunnel.DummyAddr{}
-			log.Printf("multi-resolver UDP: %d resolvers (smart)", len(udpAddrs))
+		} else {
+			addrs := strings.Split(c.dnsAddr, ",")
+			if len(addrs) == 1 {
+				// Single resolver — original behavior, no wrapping.
+				remoteAddr, err = net.ResolveUDPAddr("udp", strings.TrimSpace(addrs[0]))
+				if err != nil {
+					cancel()
+					return fmt.Errorf("resolving UDP address: %v", err)
+				}
+				pconn, err = net.ListenUDP("udp", nil)
+				if err != nil {
+					cancel()
+					return fmt.Errorf("opening UDP socket: %v", err)
+				}
+			} else {
+				// Multiple resolvers — broadcast every query to all, first response wins.
+				var udpAddrs []*net.UDPAddr
+				for _, a := range addrs {
+					addr, rErr := net.ResolveUDPAddr("udp", strings.TrimSpace(a))
+					if rErr != nil {
+						cancel()
+						return fmt.Errorf("resolving UDP address %s: %v", a, rErr)
+					}
+					udpAddrs = append(udpAddrs, addr)
+				}
+				sconn, sErr := NewSmartUDPConn(udpAddrs)
+				if sErr != nil {
+					cancel()
+					return fmt.Errorf("opening UDP socket: %v", sErr)
+				}
+				pconn = sconn
+				remoteAddr = turbotunnel.DummyAddr{}
+				log.Printf("multi-resolver UDP: %d resolvers (smart)", len(udpAddrs))
+			}
 		}
 	}
 
@@ -474,8 +642,10 @@ func dnsNameCapacity(domain dns.Name) int {
 }
 
 // utlsDialContext connects to the given network address and initiates a TLS
-// handshake with the provided ClientHelloID.
-func utlsDialContext(ctx context.Context, network, addr string, config *utls.Config, id *utls.ClientHelloID) (*utls.UConn, error) {
+// handshake with the provided ClientHelloID. If baseDialer is non-nil, the TCP
+// connection is established through it (e.g., a SOCKS5 proxy); otherwise a
+// direct net.Dialer is used.
+func utlsDialContext(ctx context.Context, network, addr string, config *utls.Config, id *utls.ClientHelloID, baseDialer proxy.Dialer) (*utls.UConn, error) {
 	if config == nil {
 		config = &utls.Config{}
 	}
@@ -487,8 +657,13 @@ func utlsDialContext(ctx context.Context, network, addr string, config *utls.Con
 		}
 		config.ServerName = host
 	}
-	dialer := &net.Dialer{}
-	conn, err := dialer.DialContext(ctx, network, addr)
+	var conn net.Conn
+	var err error
+	if baseDialer != nil {
+		conn, err = proxyDial(ctx, baseDialer, network, addr)
+	} else {
+		conn, err = (&net.Dialer{}).DialContext(ctx, network, addr)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -501,9 +676,122 @@ func utlsDialContext(ctx context.Context, network, addr string, config *utls.Con
 	return uconn, nil
 }
 
+// proxyDial connects to addr through the given dialer, using DialContext if
+// available for proper cancellation support.
+func proxyDial(ctx context.Context, d proxy.Dialer, network, addr string) (net.Conn, error) {
+	if cd, ok := d.(proxy.ContextDialer); ok {
+		return cd.DialContext(ctx, network, addr)
+	}
+	return d.Dial(network, addr)
+}
+
+// addrForDial extracts a host:port address from a URL, suitable for dialing.
+func addrForDial(u *url.URL) (string, error) {
+	host := u.Hostname()
+	port := u.Port()
+	if port == "" {
+		switch u.Scheme {
+		case "http":
+			port = "80"
+		case "https":
+			port = "443"
+		default:
+			return "", fmt.Errorf("unsupported URL scheme %q", u.Scheme)
+		}
+	}
+	return net.JoinHostPort(host, port), nil
+}
+
+// socks5UTLSRoundTripper is an http.RoundTripper that uses uTLS for TLS
+// connections routed through a SOCKS5 proxy. Needed because the upstream
+// NewUTLSRoundTripper hardcodes net.Dialer.
+type socks5UTLSRoundTripper struct {
+	clientHelloID *utls.ClientHelloID
+	config        *utls.Config
+	baseDialer    proxy.Dialer
+	innerLock     sync.Mutex
+	inner         http.RoundTripper
+}
+
+func (rt *socks5UTLSRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	switch req.URL.Scheme {
+	case "http":
+		return http.DefaultTransport.RoundTrip(req)
+	case "https":
+	default:
+		return nil, fmt.Errorf("unsupported URL scheme %q", req.URL.Scheme)
+	}
+
+	var err error
+	rt.innerLock.Lock()
+	if rt.inner == nil {
+		rt.inner, err = rt.makeRoundTripper(req)
+	}
+	rt.innerLock.Unlock()
+	if err != nil {
+		return nil, err
+	}
+	return rt.inner.RoundTrip(req)
+}
+
+func (rt *socks5UTLSRoundTripper) makeRoundTripper(req *http.Request) (http.RoundTripper, error) {
+	addr, err := addrForDial(req.URL)
+	if err != nil {
+		return nil, err
+	}
+
+	bootstrapConn, err := utlsDialContext(req.Context(), "tcp", addr, rt.config, rt.clientHelloID, rt.baseDialer)
+	if err != nil {
+		return nil, err
+	}
+
+	protocol := bootstrapConn.ConnectionState().NegotiatedProtocol
+
+	var lock sync.Mutex
+	dialTLS := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		lock.Lock()
+		defer lock.Unlock()
+
+		if bootstrapConn != nil {
+			uconn := bootstrapConn
+			bootstrapConn = nil
+			return uconn, nil
+		}
+
+		uconn, err := utlsDialContext(ctx, "tcp", addr, rt.config, rt.clientHelloID, rt.baseDialer)
+		if err != nil {
+			return nil, err
+		}
+		if uconn.ConnectionState().NegotiatedProtocol != protocol {
+			return nil, fmt.Errorf("unexpected switch from ALPN %q to %q",
+				protocol, uconn.ConnectionState().NegotiatedProtocol)
+		}
+		return uconn, nil
+	}
+
+	switch protocol {
+	case http2.NextProtoTLS:
+		return &http2.Transport{
+			DialTLS: func(network, addr string, _ *tls.Config) (net.Conn, error) {
+				return dialTLS(context.Background(), network, addr)
+			},
+		}, nil
+	default:
+		tr := http.DefaultTransport.(*http.Transport).Clone()
+		tr.DialTLSContext = dialTLS
+		return tr, nil
+	}
+}
+
 // handle proxies data between a local TCP connection and a smux stream.
 // copyBufSize controls the io.CopyBuffer size; 0 means use io.Copy (default 32KB).
-func handle(local *net.TCPConn, sess *smux.Session, conv uint32, copyBufSize int) error {
+// When socksUser is set, it intercepts the SOCKS5 handshake and injects
+// credentials automatically so clients never need to supply them.
+func handle(local *net.TCPConn, sess *smux.Session, conv uint32, copyBufSize int, socksUser, socksPass string) error {
+	if socksUser != "" {
+		return handleWithAuth(local, sess, conv, copyBufSize, socksUser, socksPass)
+	}
+
 	stream, err := sess.OpenStream()
 	if err != nil {
 		return fmt.Errorf("session %08x opening stream: %v", conv, err)
@@ -551,6 +839,169 @@ func handle(local *net.TCPConn, sess *smux.Session, conv uint32, copyBufSize int
 	return err
 }
 
+// handleWithAuth intercepts the SOCKS5 handshake, injects the server credentials
+// transparently, and tells the client no authentication is needed. This means
+// browsers and tools connect to 127.0.0.1:PORT with no credentials regardless
+// of whether the server requires username/password auth.
+func handleWithAuth(local *net.TCPConn, sess *smux.Session, conv uint32, copyBufSize int, socksUser, socksPass string) error {
+	// Read client greeting: [VER NMETHODS METHODS...]
+	header := make([]byte, 2)
+	if _, err := io.ReadFull(local, header); err != nil {
+		return err
+	}
+	if header[0] != 5 {
+		return fmt.Errorf("not SOCKS5 (ver=%d)", header[0])
+	}
+	methods := make([]byte, int(header[1]))
+	if len(methods) > 0 {
+		if _, err := io.ReadFull(local, methods); err != nil {
+			return err
+		}
+	}
+
+	// Open smux stream to server.
+	stream, err := sess.OpenStream()
+	if err != nil {
+		local.Write([]byte{5, 1, 0, 1, 0, 0, 0, 0, 0, 0})
+		return fmt.Errorf("session %08x opening stream: %v", conv, err)
+	}
+	defer func() {
+		log.Printf("end stream %08x:%d (auth)", conv, stream.ID())
+		stream.Close()
+	}()
+	log.Printf("begin stream %08x:%d (auth)", conv, stream.ID())
+
+	// Offer the server both no-auth and user/pass so we handle either case.
+	if _, err := stream.Write([]byte{5, 2, 0x00, 0x02}); err != nil {
+		local.Write([]byte{5, 1, 0, 1, 0, 0, 0, 0, 0, 0})
+		return err
+	}
+	serverChoice := make([]byte, 2)
+	if _, err := io.ReadFull(stream, serverChoice); err != nil {
+		local.Write([]byte{5, 1, 0, 1, 0, 0, 0, 0, 0, 0})
+		return fmt.Errorf("reading server auth choice: %v", err)
+	}
+	switch serverChoice[1] {
+	case 0x00:
+		// Server is happy with no auth — nothing to do.
+	case 0x02:
+		// Server requires user/pass — inject credentials from profile.
+		authMsg := []byte{0x01, byte(len(socksUser))}
+		authMsg = append(authMsg, []byte(socksUser)...)
+		authMsg = append(authMsg, byte(len(socksPass)))
+		authMsg = append(authMsg, []byte(socksPass)...)
+		if _, err := stream.Write(authMsg); err != nil {
+			local.Write([]byte{5, 1, 0, 1, 0, 0, 0, 0, 0, 0})
+			return err
+		}
+		authResp := make([]byte, 2)
+		if _, err := io.ReadFull(stream, authResp); err != nil || authResp[1] != 0 {
+			local.Write([]byte{5, 1, 0, 1, 0, 0, 0, 0, 0, 0})
+			return fmt.Errorf("SOCKS5 auth rejected by server")
+		}
+	default:
+		local.Write([]byte{5, 1, 0, 1, 0, 0, 0, 0, 0, 0})
+		return fmt.Errorf("server rejected all auth methods (0x%02x)", serverChoice[1])
+	}
+
+	// Tell the client: no authentication required.
+	if _, err := local.Write([]byte{5, 0}); err != nil {
+		return err
+	}
+
+	// Read client CONNECT request: [VER CMD RSV ATYP ...] and forward to server.
+	reqFixed := make([]byte, 4)
+	if _, err := io.ReadFull(local, reqFixed); err != nil {
+		return err
+	}
+	if _, err := stream.Write(reqFixed); err != nil {
+		return err
+	}
+	switch reqFixed[3] {
+	case 0x01: // IPv4 (4) + port (2)
+		buf := make([]byte, 6)
+		if _, err := io.ReadFull(local, buf); err != nil {
+			return err
+		}
+		stream.Write(buf)
+	case 0x03: // domain: len(1) + domain + port(2)
+		lenB := make([]byte, 1)
+		if _, err := io.ReadFull(local, lenB); err != nil {
+			return err
+		}
+		stream.Write(lenB)
+		rest := make([]byte, int(lenB[0])+2)
+		if _, err := io.ReadFull(local, rest); err != nil {
+			return err
+		}
+		stream.Write(rest)
+	case 0x04: // IPv6 (16) + port (2)
+		buf := make([]byte, 18)
+		if _, err := io.ReadFull(local, buf); err != nil {
+			return err
+		}
+		stream.Write(buf)
+	default:
+		return fmt.Errorf("unsupported ATYP: %d", reqFixed[3])
+	}
+
+	// Forward server CONNECT response to client.
+	respFixed := make([]byte, 4)
+	if _, err := io.ReadFull(stream, respFixed); err != nil {
+		return err
+	}
+	local.Write(respFixed)
+	switch respFixed[3] {
+	case 0x01:
+		buf := make([]byte, 6)
+		io.ReadFull(stream, buf)
+		local.Write(buf)
+	case 0x03:
+		lenB := make([]byte, 1)
+		io.ReadFull(stream, lenB)
+		local.Write(lenB)
+		rest := make([]byte, int(lenB[0])+2)
+		io.ReadFull(stream, rest)
+		local.Write(rest)
+	case 0x04:
+		buf := make([]byte, 18)
+		io.ReadFull(stream, buf)
+		local.Write(buf)
+	}
+	if respFixed[1] != 0 {
+		return fmt.Errorf("CONNECT failed: rep=0x%02x", respFixed[1])
+	}
+
+	// Relay data bidirectionally.
+	doCopy := func(dst io.Writer, src io.Reader) (int64, error) {
+		if copyBufSize > 0 {
+			return io.CopyBuffer(dst, src, make([]byte, copyBufSize))
+		}
+		return io.Copy(dst, src)
+	}
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		_, err := doCopy(stream, local)
+		if err != nil && err != io.EOF && !errors.Is(err, io.ErrClosedPipe) {
+			log.Printf("stream %08x:%d copy stream←local: %v", conv, stream.ID(), err)
+		}
+		local.CloseRead()
+		stream.Close()
+	}()
+	go func() {
+		defer wg.Done()
+		_, err := doCopy(local, stream)
+		if err != nil && err != io.EOF && !errors.Is(err, io.ErrClosedPipe) {
+			log.Printf("stream %08x:%d copy local←stream: %v", conv, stream.ID(), err)
+		}
+		local.CloseWrite()
+	}()
+	wg.Wait()
+	return nil
+}
+
 // run is the main tunnel loop: KCP → Noise → smux → TCP listener.
 func (c *DnsttClient) run(ctx context.Context, pubkey []byte, domain dns.Name, localAddr *net.TCPAddr, remoteAddr net.Addr, pconn net.PacketConn) error {
 	defer pconn.Close()
@@ -578,6 +1029,19 @@ func (c *DnsttClient) run(ctx context.Context, pubkey []byte, domain dns.Name, l
 	}
 	if mtu < 80 {
 		return fmt.Errorf("domain %s leaves only %d bytes for payload", domain, mtu)
+	}
+	if c.stealthMode {
+		// Stealth overrides user query size: cap to 50 bytes + 0–20 random
+		// EDNS0 padding so each query is randomly sized between 50–70 bytes.
+		if mtu > 50 {
+			log.Printf("stealth: overriding MTU from %d to 50 (random 50–70 byte queries)", mtu)
+			mtu = 50
+		}
+		noizdns.QueryPadding = true
+		noizdns.QueryPaddingMax = 20
+	} else if c.queryPaddingMax > 0 {
+		noizdns.QueryPadding = true
+		noizdns.QueryPaddingMax = c.queryPaddingMax
 	}
 	if c.maxPayload >= 50 && c.maxPayload < mtu {
 		log.Printf("capping MTU from %d to %d (maxPayload)", mtu, c.maxPayload)
@@ -692,7 +1156,7 @@ func (c *DnsttClient) run(ctx context.Context, pubkey []byte, domain dns.Name, l
 			if streamSem != nil {
 				defer func() { <-streamSem }()
 			}
-			err := handle(local.(*net.TCPConn), sess, conn.GetConv(), copyBufSize)
+			err := handle(local.(*net.TCPConn), sess, conn.GetConv(), copyBufSize, c.socksUser, c.socksPass)
 			if err != nil {
 				log.Printf("handle: %v", err)
 			}

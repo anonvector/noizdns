@@ -153,6 +153,12 @@ From the `cli/` directory in SlipNet:
 go build -trimpath -ldflags="-s -w -X main.version=v2.3.1" -o slipnet .
 ```
 
+## Server Installation
+
+For a guided server setup script and installation instructions, see **[SlipGate](https://github.com/anonvector/slipgate)**.
+
+SlipGate automates the full server deployment process including DNS configuration, key generation, and service setup.
+
 ## Server Usage
 
 ### Generate Keys
