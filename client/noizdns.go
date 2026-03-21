@@ -260,7 +260,7 @@ func makeSendFunc(clientID turbotunnel.ClientID, domain dns.Name, cdnAlways bool
 		_ = binary.Read(rand.Reader, binary.BigEndian, &id)
 		query := &dns.Message{
 			ID:    id,
-			Flags: 0x0120, // QR=0, RD=1, AD=1 (mimic Chrome since ~2020)
+			Flags: 0x0100, // QR=0, RD=1
 			Question: []dns.Question{
 				{
 					Name:  name,
@@ -273,7 +273,7 @@ func makeSendFunc(clientID turbotunnel.ClientID, domain dns.Name, cdnAlways bool
 			{
 				Name:  dns.Name{},
 				Type:  dns.RRTypeOPT,
-				Class: 1452, // EDNS0 UDP payload size — matches Chrome
+				Class: 4096, // requester's UDP payload size
 				TTL:   0,
 				Data:  []byte{},
 			},
