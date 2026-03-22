@@ -1030,19 +1030,6 @@ func (c *DnsttClient) run(ctx context.Context, pubkey []byte, domain dns.Name, l
 	if mtu < 80 {
 		return fmt.Errorf("domain %s leaves only %d bytes for payload", domain, mtu)
 	}
-	if c.stealthMode {
-		// Stealth overrides user query size: cap to 50 bytes + 0–20 random
-		// EDNS0 padding so each query is randomly sized between 50–70 bytes.
-		if mtu > 50 {
-			log.Printf("stealth: overriding MTU from %d to 50 (random 50–70 byte queries)", mtu)
-			mtu = 50
-		}
-		noizdns.QueryPadding = true
-		noizdns.QueryPaddingMax = 20
-	} else if c.queryPaddingMax > 0 {
-		noizdns.QueryPadding = true
-		noizdns.QueryPaddingMax = c.queryPaddingMax
-	}
 	if c.maxPayload >= 50 && c.maxPayload < mtu {
 		log.Printf("capping MTU from %d to %d (maxPayload)", mtu, c.maxPayload)
 		mtu = c.maxPayload
