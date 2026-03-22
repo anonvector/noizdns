@@ -1131,6 +1131,11 @@ func (c *DnsttClient) run(ctx context.Context, pubkey []byte, domain dns.Name, l
 			}
 			return err
 		}
+		// Stop accepting if the tunnel session is dead.
+		if sess.IsClosed() {
+			local.Close()
+			return fmt.Errorf("session %08x closed", conn.GetConv())
+		}
 		// Non-blocking: reject immediately if at capacity.
 		// Keeps the accept loop responsive for other connections.
 		if streamSem != nil {
@@ -1147,7 +1152,7 @@ func (c *DnsttClient) run(ctx context.Context, pubkey []byte, domain dns.Name, l
 				defer func() { <-streamSem }()
 			}
 			err := handle(local.(*net.TCPConn), sess, conn.GetConv(), copyBufSize, c.socksUser, c.socksPass)
-			if err != nil {
+			if err != nil && !sess.IsClosed() {
 				log.Printf("handle: %v", err)
 			}
 		}()
