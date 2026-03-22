@@ -96,6 +96,7 @@ type DnsttClient struct {
 	cancel        context.CancelFunc
 	listener      net.Listener
 	transportConn net.PacketConn // raw UDP/DoH/DoT/TCP transport — closed in Stop to kill sendLoop immediately
+	kcpConn       net.Conn      // KCP connection — deadline-forced in Stop to prevent blocking Close
 }
 
 // NewClient creates a new DNSTT client. Transport is auto-detected from dnsAddr:
@@ -598,6 +599,11 @@ func (c *DnsttClient) Stop() {
 		c.cancel()
 		c.cancel = nil
 	}
+	// Force-expire the KCP connection so its Close() (and smux.Close above it)
+	// return immediately instead of blocking on retransmit timeouts.
+	if c.kcpConn != nil {
+		c.kcpConn.SetDeadline(time.Now())
+	}
 	if c.listener != nil {
 		c.listener.Close()
 		c.listener = nil
@@ -1031,9 +1037,16 @@ func (c *DnsttClient) run(ctx context.Context, pubkey []byte, domain dns.Name, l
 	if err != nil {
 		return fmt.Errorf("opening KCP conn: %v", err)
 	}
+	// Store KCP conn so Stop() can force-deadline it for fast shutdown.
+	c.mu.Lock()
+	c.kcpConn = conn
+	c.mu.Unlock()
 	defer func() {
 		log.Printf("end session %08x", conn.GetConv())
 		conn.Close()
+		c.mu.Lock()
+		c.kcpConn = nil
+		c.mu.Unlock()
 	}()
 	log.Printf("begin session %08x", conn.GetConv())
 
