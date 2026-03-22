@@ -35,10 +35,6 @@ const (
 // for jitter to be worth the latency cost.
 const DefaultJitterMax = 0
 
-// rrTypeHTTPS is the SVCB/HTTPS DNS record type (65).
-// Chrome sends these since ~2022 for HTTPS-capable domains.
-const rrTypeHTTPS = 65
-
 // QueryPadding enables random EDNS0 padding (RFC 7830) on every tunnel query,
 // adding 0–QueryPaddingMax random bytes to vary the wire size. Use together
 // with --query-size to keep queries small AND randomly sized.
@@ -50,8 +46,10 @@ var QueryPadding = false
 var QueryPaddingMax = 20
 
 // DefaultCoverDomains are real domains queried as cover traffic.
-// Mixes international platform domains (Android/iOS background traffic)
-// with domestic domains reachable during internet shutdowns.
+// DefaultCoverDomains mixes international platform domains (Android/iOS
+// background traffic) with domestic domains that remain reachable during
+// internet shutdowns. This ensures cover traffic looks natural in both
+// normal conditions and restricted network states.
 var DefaultCoverDomains = []string{
 	// Android/iOS background traffic
 	"connectivitycheck.gstatic.com",
@@ -76,33 +74,6 @@ var DefaultCoverDomains = []string{
 	"tamin.ir",
 }
 
-// chromeInfraDomains are domains Chrome queries on startup and periodically
-// (Safe Browsing, updates, sync, predictor). Used for background activity.
-var chromeInfraDomains = []string{
-	"clients1.google.com",
-	"clients2.google.com",
-	"update.googleapis.com",
-	"safebrowsing.googleapis.com",
-	"accounts.google.com",
-	"ssl.gstatic.com",
-	"fonts.googleapis.com",
-	"www.gstatic.com",
-	"translate.googleapis.com",
-}
-
-// backgroundDomains are CDN/analytics domains Chrome resolves in the background.
-var backgroundDomains = []string{
-	"www.googletagmanager.com",
-	"www.google-analytics.com",
-	"pagead2.googlesyndication.com",
-	"ocsp.digicert.com",
-	"ocsp.pki.goog",
-	"crl.pki.goog",
-	"cloudflareinsights.com",
-	"cdn.jsdelivr.net",
-	"cdnjs.cloudflare.com",
-}
-
 // chineseOemInterceptedDomains are domains that Chinese OEM ROMs (MIUI,
 // HyperOS, EMUI) intercept or override DNS responses for.
 var chineseOemInterceptedDomains = map[string]bool{
@@ -111,14 +82,6 @@ var chineseOemInterceptedDomains = map[string]bool{
 	"play.googleapis.com":                  true,
 	"mtalk.google.com":                     true,
 	"firebaseinstallations.googleapis.com": true,
-	// Chrome infra domains intercepted by Chinese OEM ROMs
-	"clients1.google.com":         true,
-	"clients2.google.com":         true,
-	"update.googleapis.com":       true,
-	"accounts.google.com":         true,
-	"translate.googleapis.com":    true,
-	"www.google-analytics.com":    true,
-	"pagead2.googlesyndication.com": true,
 }
 
 // chineseOemManufacturers maps lowercase manufacturer names to true.
@@ -260,7 +223,7 @@ func makeSendFunc(clientID turbotunnel.ClientID, domain dns.Name, cdnAlways bool
 		_ = binary.Read(rand.Reader, binary.BigEndian, &id)
 		query := &dns.Message{
 			ID:    id,
-			Flags: 0x0100, // QR=0, RD=1
+			Flags: 0x0100, // QR = 0, RD = 1
 			Question: []dns.Question{
 				{
 					Name:  name,
@@ -273,7 +236,7 @@ func makeSendFunc(clientID turbotunnel.ClientID, domain dns.Name, cdnAlways bool
 			{
 				Name:  dns.Name{},
 				Type:  dns.RRTypeOPT,
-				Class: 4096, // requester's UDP payload size
+				Class: 4096, // requester's UDP payload size — match upstream dnstt; server caps actual response
 				TTL:   0,
 				Data:  []byte{},
 			},
@@ -335,176 +298,49 @@ func randInt(n int) int {
 	return int(v.Int64())
 }
 
-// randBool returns true with the given probability [0.0, 1.0].
-func randBool(prob float64) bool {
-	var b [1]byte
-	_, _ = rand.Read(b[:])
-	return float64(b[0])/256.0 < prob
-}
-
-// pickRandom returns a random element from the slice.
-func pickRandom(s []string) string {
-	return s[randInt(len(s))]
-}
-
-// sleepRandMs sleeps for a random duration between minMs and maxMs milliseconds.
-func sleepRandMs(minMs, maxMs int) {
-	ms := minMs
-	if maxMs > minMs {
-		ms += randInt(maxMs - minMs)
+// coverTrafficLoop sends periodic legitimate DNS queries to real domains to
+// dilute the tunnel-to-total DNS ratio. minInterval/maxInterval control timing;
+// stealth mode uses shorter intervals for a higher cover-to-tunnel ratio.
+func coverTrafficLoop(coverDomains []string, transport net.PacketConn, addr net.Addr, minInterval, maxInterval time.Duration) {
+	spread := int((maxInterval - minInterval) / time.Second)
+	if spread <= 0 {
+		spread = 1
 	}
-	if ms > 0 {
-		time.Sleep(time.Duration(ms) * time.Millisecond)
-	}
-}
-
-// sendCoverQuery sends a single cover DNS query with Chrome-like flags.
-// Best-effort; errors are silently ignored.
-func sendCoverQuery(transport net.PacketConn, addr net.Addr, domain string, qtype uint16) {
-	name, err := dns.ParseName(domain)
-	if err != nil {
-		return
-	}
-	var id uint16
-	_ = binary.Read(rand.Reader, binary.BigEndian, &id)
-	query := &dns.Message{
-		ID:    id,
-		Flags: 0x0120, // QR=0, RD=1, AD=1 (Chrome since ~2020)
-		Question: []dns.Question{
-			{Name: name, Type: qtype, Class: dns.ClassIN},
-		},
-		Additional: []dns.RR{
-			{
-				Name:  dns.Name{},
-				Type:  dns.RRTypeOPT,
-				Class: 1452, // EDNS0 UDP payload size — matches Chrome
-				TTL:   0,
-				Data:  []byte{},
-			},
-		},
-	}
-	buf, err := query.WireFormat()
-	if err != nil {
-		return
-	}
-	_, _ = transport.WriteTo(buf, addr)
-}
-
-// simulatePageLoad sends a burst of cover queries mimicking a Chrome page load.
-// Chrome resolves all resources for a page in a rapid burst: primary domain
-// (A + AAAA + sometimes HTTPS), then 3-10 sub-resource lookups for CDNs,
-// analytics, fonts, etc. The burst completes in 100-500ms, then silence.
-func simulatePageLoad(coverDomains, bgDomains, chromeDomains []string, transport net.PacketConn, addr net.Addr) {
-	primary := pickRandom(coverDomains)
-
-	// Chrome always sends A + AAAA for the primary domain
-	sendCoverQuery(transport, addr, primary, dns.RRTypeA)
-	sleepRandMs(1, 10)
-	sendCoverQuery(transport, addr, primary, dns.RRTypeAAAA)
-
-	// Chrome sometimes sends HTTPS (type 65) since ~2022
-	if randBool(0.6) {
-		sleepRandMs(1, 5)
-		sendCoverQuery(transport, addr, primary, rrTypeHTTPS)
-	}
-
-	// Sub-resource lookups (CDNs, analytics, fonts, etc.)
-	subCount := 3 + randInt(8)
-	for i := 0; i < subCount; i++ {
-		sleepRandMs(10, 120)
-
-		// Pick from different pools like a real page load
-		var domain string
-		r := randInt(10)
-		switch {
-		case r < 5: // 50% browsing domains
-			domain = pickRandom(coverDomains)
-		case r < 8: // 30% background/CDN domains
-			domain = pickRandom(bgDomains)
-		default: // 20% Chrome infra
-			domain = pickRandom(chromeDomains)
-		}
-
-		sendCoverQuery(transport, addr, domain, dns.RRTypeA)
-
-		// Chrome sends A + AAAA together ~80% of the time
-		if randBool(0.8) {
-			sleepRandMs(0, 5)
-			sendCoverQuery(transport, addr, domain, dns.RRTypeAAAA)
-		}
-	}
-}
-
-// simulateChromeBackground sends 1-3 Chrome infra queries (Safe Browsing,
-// update checks, predictor pre-resolve) with 50-500ms spacing.
-func simulateChromeBackground(chromeDomains []string, transport net.PacketConn, addr net.Addr) {
-	count := 1 + randInt(3)
-	for i := 0; i < count; i++ {
-		domain := pickRandom(chromeDomains)
-		sendCoverQuery(transport, addr, domain, dns.RRTypeA)
-		sleepRandMs(50, 500)
-	}
-}
-
-// coverTrafficLoop sends cover DNS queries in page-load bursts to mimic real
-// Chrome browsing. Instead of steady single queries, it sends 5-15 queries
-// in rapid succession (100-500ms), then goes silent for several seconds —
-// matching the burst pattern of actual page loads.
-//
-// Between bursts, occasional Chrome background queries (Safe Browsing,
-// update checks) are injected for additional realism.
-//
-// pageLoadInterval controls the average seconds between page-load bursts.
-// bgInterval controls the average seconds between background queries.
-func coverTrafficLoop(coverDomains, bgDomains, chromeDomains []string, transport net.PacketConn, addr net.Addr, pageLoadInterval, bgInterval time.Duration) {
-	// Chrome startup burst: resolve infra domains on "launch"
-	count := 3 + randInt(3)
-	for i := 0; i < count; i++ {
-		domain := pickRandom(chromeDomains)
-		sendCoverQuery(transport, addr, domain, dns.RRTypeA)
-		sleepRandMs(5, 30)
-	}
-
-	pageLoadSecs := int(pageLoadInterval / time.Second)
-	if pageLoadSecs < 3 {
-		pageLoadSecs = 3
-	}
-	bgSecs := int(bgInterval / time.Second)
-	if bgSecs < 5 {
-		bgSecs = 5
-	}
-
 	for {
-		// Simulate a page-load burst
-		simulatePageLoad(coverDomains, bgDomains, chromeDomains, transport, addr)
+		var b [1]byte
+		_, _ = rand.Read(b[:])
+		delay := minInterval + time.Duration(int(b[0])%spread)*time.Second
+		time.Sleep(delay)
 
-		// Inter-burst silence with jitter (0.5x - 2.0x of base interval)
-		var jb [1]byte
-		_, _ = rand.Read(jb[:])
-		jitter := 0.5 + float64(jb[0])/170.0 // ~[0.5, 2.0]
-		waitSecs := int(float64(pageLoadSecs) * jitter)
-		if waitSecs < 3 {
-			waitSecs = 3
-		}
-		if waitSecs > 90 {
-			waitSecs = 90
+		// Pick a random cover domain.
+		idx, _ := rand.Int(rand.Reader, big.NewInt(int64(len(coverDomains))))
+		coverDomain := coverDomains[idx.Int64()]
+
+		name, err := dns.ParseName(coverDomain)
+		if err != nil {
+			continue
 		}
 
-		// During the silence, occasionally fire Chrome background queries
-		elapsed := 0
-		for elapsed < waitSecs {
-			chunk := 3 + randInt(bgSecs-2)
-			if chunk > waitSecs-elapsed {
-				chunk = waitSecs - elapsed
-			}
-			time.Sleep(time.Duration(chunk) * time.Second)
-			elapsed += chunk
-
-			// ~30% chance of background activity per chunk
-			if randBool(0.3) {
-				simulateChromeBackground(chromeDomains, transport, addr)
-			}
+		var id uint16
+		_ = binary.Read(rand.Reader, binary.BigEndian, &id)
+		query := &dns.Message{
+			ID:    id,
+			Flags: 0x0100, // QR = 0, RD = 1
+			Question: []dns.Question{
+				{
+					Name:  name,
+					Type:  dns.RRTypeA,
+					Class: dns.ClassIN,
+				},
+			},
 		}
+		buf, err := query.WireFormat()
+		if err != nil {
+			continue
+		}
+		// Best-effort; ignore errors. recvLoop will silently discard
+		// responses that don't match our tunnel domain.
+		_, _ = transport.WriteTo(buf, addr)
 	}
 }
 
@@ -551,8 +387,6 @@ func NewNoizDNSPacketConnStealth(transport net.PacketConn, addr net.Addr, domain
 func newNoizConn(transport net.PacketConn, addr net.Addr, domain dns.Name, config *dnsttclient.DNSPacketConnConfig, stealth bool, deviceManufacturer string) *dnsttclient.DNSPacketConn {
 	clientID := turbotunnel.NewClientID()
 	coverDomains := filterCoverDomains(DefaultCoverDomains, deviceManufacturer)
-	filteredChrome := filterCoverDomains(chromeInfraDomains, deviceManufacturer)
-	filteredBackground := filterCoverDomains(backgroundDomains, deviceManufacturer)
 
 	hooks := &dnsttclient.DNSPacketConnHooks{
 		CustomSendFunc: makeSendFunc(clientID, domain, stealth),
@@ -567,18 +401,18 @@ func newNoizConn(transport net.PacketConn, addr net.Addr, domain dns.Name, confi
 		hooks.PreSendHook = makeJitterHook(0, DefaultJitterMax)
 	}
 
-	// Cover traffic: always enabled with Chrome page-load burst pattern.
-	// Stealth: faster burst cadence (5s page loads, 10s background).
-	// Normal: relaxed cadence (15s page loads, 45s background).
+	// Cover traffic: always enabled.
+	// Stealth: 3-8s cover traffic interval (more frequent than normal).
+	// Normal: relaxed 5-15s interval.
 	if len(coverDomains) > 0 {
-		pageLoadInterval := 15 * time.Second
-		bgInterval := 45 * time.Second
+		minInterval := 5 * time.Second
+		maxInterval := 15 * time.Second
 		if stealth {
-			pageLoadInterval = 5 * time.Second
-			bgInterval = 10 * time.Second
+			minInterval = 3 * time.Second
+			maxInterval = 8 * time.Second
 		}
 		hooks.OnStart = func(transport net.PacketConn, addr net.Addr) {
-			go coverTrafficLoop(coverDomains, filteredBackground, filteredChrome, transport, addr, pageLoadInterval, bgInterval)
+			go coverTrafficLoop(coverDomains, transport, addr, minInterval, maxInterval)
 		}
 	}
 
