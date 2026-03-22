@@ -84,9 +84,6 @@ type DnsttClient struct {
 	socksUser string
 	socksPass string
 
-	// queryPaddingMax sets the max EDNS0 padding bytes per query (0 = disabled).
-	queryPaddingMax int
-
 	// socksProxyAddr is the upstream SOCKS5 proxy address ("host:port") to route
 	// DNS transport connections through. Empty = direct connection (default).
 	// Used when DNSTT is a chain layer behind another proxy (e.g., SSH → DNSTT).
@@ -188,13 +185,6 @@ func (c *DnsttClient) SetUTLSFingerprint(fingerprint string) {
 // Must be called before Start.
 func (c *DnsttClient) SetDeviceManufacturer(manufacturer string) {
 	c.deviceManufacturer = manufacturer
-}
-
-// SetQueryPadding enables random EDNS0 padding (RFC 7830) on every tunnel
-// query, adding 0–maxBytes random bytes to vary the wire size.
-// Must be called before Start.
-func (c *DnsttClient) SetQueryPadding(maxBytes int) {
-	c.queryPaddingMax = maxBytes
 }
 
 // SetSocksCredentials sets the SOCKS5 username and password to inject
