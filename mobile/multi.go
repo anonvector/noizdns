@@ -4,15 +4,18 @@ import (
 	"log"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
+
+	"www.bamsoftware.com/git/dnstt.git/dns"
 )
 
 const (
 	// deadTimeout is how long a resolver can go without responding (while
 	// we are actively sending to it) before it is marked dead.
-	// Kept short so dead resolvers are detected quickly and traffic shifts
-	// to working ones within a few seconds.
-	deadTimeout = 8 * time.Second
+	// Set high enough to tolerate congested/high-latency networks common
+	// in censored regions, while still detecting truly dead resolvers.
+	deadTimeout = 12 * time.Second
 	// probeInterval is the minimum gap between sending probe traffic to a
 	// dead resolver to check whether it has recovered.
 	probeInterval = 15 * time.Second
@@ -163,76 +166,337 @@ func (t *resolverTracker) close() {
 }
 
 // ---------------------------------------------------------------------------
-// SmartUDPConn — replaces BroadcastUDPConn
+// PerQueryUDPConn — per-query fresh sockets with forged response filtering
 // ---------------------------------------------------------------------------
 
-// SmartUDPConn wraps a single UDP socket and fans out each query to ALL alive
-// resolvers simultaneously. KCP deduplicates responses, so the fastest reply
-// wins. Dead resolvers are periodically probed for recovery.
-type SmartUDPConn struct {
-	conn    *net.UDPConn
-	addrs   []*net.UDPAddr
-	addrMap map[string]int // IP:port → index for markRecv
-	tracker *resolverTracker
+const (
+	// udpWorkers is the number of worker goroutines in the pool.
+	// Each worker handles one query at a time on a fresh UDP socket.
+	udpWorkers = 64
+	// udpReadTimeout is how long a worker waits for a valid response
+	// after sending a query. Must be long enough for a real response to
+	// arrive, but short enough that stale workers don't accumulate.
+	udpReadTimeout = 800 * time.Millisecond
+)
+
+// ForgedStats tracks censorship-injected DNS responses.
+type ForgedStats struct {
+	SERVFAIL int64
+	NXDOMAIN int64
+	Other    int64
+	Valid    int64
 }
 
-// NewSmartUDPConn creates a smart UDP conn that distributes queries across resolvers.
-func NewSmartUDPConn(addrs []*net.UDPAddr) (*SmartUDPConn, error) {
-	conn, err := net.ListenUDP("udp", nil)
-	if err != nil {
-		return nil, err
-	}
+// udpWork is a unit of work for a per-query UDP worker.
+type udpWork struct {
+	payload []byte
+	addr    *net.UDPAddr
+	idx     int // resolver index for health tracking
+}
+
+// udpResponse is a valid response from a per-query UDP worker.
+type udpResponse struct {
+	data []byte
+	n    int
+	addr net.Addr
+}
+
+// PerQueryUDPConn creates a fresh UDP socket for every outgoing DNS query,
+// randomizing source ports to defeat fingerprinting by source-port correlation.
+// Each worker also filters forged responses (SERVFAIL/NXDOMAIN injections)
+// by reading in a loop until a valid response arrives or timeout.
+type PerQueryUDPConn struct {
+	addrs   []*net.UDPAddr
+	addrMap map[string]int
+	tracker *resolverTracker
+
+	workCh    chan udpWork
+	recvCh    chan udpResponse
+	closeCh   chan struct{}
+	closeOnce sync.Once
+	wg        sync.WaitGroup
+
+	// Forged response counters (atomic).
+	forgedSERVFAIL int64
+	forgedNXDOMAIN int64
+	forgedOther    int64
+	validCount     int64
+}
+
+// NewPerQueryUDPConn creates a per-query UDP conn with a worker pool.
+func NewPerQueryUDPConn(addrs []*net.UDPAddr) *PerQueryUDPConn {
 	addrMap := make(map[string]int, len(addrs))
 	for i, a := range addrs {
 		addrMap[a.String()] = i
 	}
-	return &SmartUDPConn{
-		conn:    conn,
+	s := &PerQueryUDPConn{
 		addrs:   addrs,
 		addrMap: addrMap,
 		tracker: newResolverTracker(len(addrs)),
-	}, nil
+		workCh:  make(chan udpWork, 256),
+		recvCh:  make(chan udpResponse, 256),
+		closeCh: make(chan struct{}),
+	}
+	s.wg.Add(udpWorkers)
+	for i := 0; i < udpWorkers; i++ {
+		go s.worker()
+	}
+	return s
 }
 
-func (s *SmartUDPConn) WriteTo(p []byte, _ net.Addr) (int, error) {
+// worker processes send-and-receive jobs on fresh UDP sockets.
+func (s *PerQueryUDPConn) worker() {
+	defer s.wg.Done()
+	for {
+		select {
+		case work, ok := <-s.workCh:
+			if !ok {
+				return
+			}
+			s.handleQuery(work)
+		case <-s.closeCh:
+			return
+		}
+	}
+}
+
+// handleQuery sends a DNS query on a fresh socket and reads the first response.
+// Stats are tracked for observability but all responses are passed through —
+// the dnstt library's dnsResponsePayload handles real validation.
+func (s *PerQueryUDPConn) handleQuery(work udpWork) {
+	conn, err := net.DialUDP("udp", nil, work.addr)
+	if err != nil {
+		return
+	}
+	defer conn.Close()
+
+	_, err = conn.Write(work.payload)
+	if err != nil {
+		return
+	}
+
+	conn.SetReadDeadline(time.Now().Add(udpReadTimeout))
+	var buf [4096]byte
+	n, err := conn.Read(buf[:])
+	if err != nil {
+		return
+	}
+
+	// Track RCODE stats for observability.
+	if n >= 4 {
+		rcode := int(buf[3]) & 0x0f
+		switch rcode {
+		case dns.RcodeServerFailure:
+			atomic.AddInt64(&s.forgedSERVFAIL, 1)
+		case dns.RcodeNameError:
+			atomic.AddInt64(&s.forgedNXDOMAIN, 1)
+		case dns.RcodeNoError:
+			atomic.AddInt64(&s.validCount, 1)
+		default:
+			atomic.AddInt64(&s.forgedOther, 1)
+		}
+	}
+
+	s.tracker.markRecv(work.idx)
+
+	resp := udpResponse{
+		data: make([]byte, n),
+		n:    n,
+		addr: work.addr,
+	}
+	copy(resp.data, buf[:n])
+
+	select {
+	case s.recvCh <- resp:
+	case <-s.closeCh:
+	}
+}
+
+func (s *PerQueryUDPConn) WriteTo(p []byte, _ net.Addr) (int, error) {
 	targets := s.tracker.pickAlive()
-	var lastN int
-	var lastErr error
 	for _, idx := range targets {
 		s.tracker.markSent(idx)
-		n, err := s.conn.WriteTo(p, s.addrs[idx])
-		if err != nil {
-			lastErr = err
-		} else {
-			lastN = n
-			lastErr = nil
+		// Copy payload — workers may run concurrently after we return.
+		payload := make([]byte, len(p))
+		copy(payload, p)
+		select {
+		case s.workCh <- udpWork{payload: payload, addr: s.addrs[idx], idx: idx}:
+		case <-s.closeCh:
+			return 0, net.ErrClosed
 		}
 	}
-	if lastErr == nil {
-		return lastN, nil
-	}
-	return 0, lastErr
+	return len(p), nil
 }
 
-func (s *SmartUDPConn) ReadFrom(p []byte) (int, net.Addr, error) {
-	n, addr, err := s.conn.ReadFrom(p)
-	if err == nil {
-		if idx, ok := s.addrMap[addr.String()]; ok {
-			s.tracker.markRecv(idx)
+func (s *PerQueryUDPConn) ReadFrom(p []byte) (int, net.Addr, error) {
+	select {
+	case resp, ok := <-s.recvCh:
+		if !ok {
+			return 0, nil, net.ErrClosed
+		}
+		return copy(p, resp.data), resp.addr, nil
+	case <-s.closeCh:
+		return 0, nil, net.ErrClosed
+	}
+}
+
+func (s *PerQueryUDPConn) Close() error {
+	s.closeOnce.Do(func() {
+		s.tracker.close()
+		close(s.closeCh)
+		s.wg.Wait()
+		close(s.recvCh)
+	})
+	return nil
+}
+
+// ForgedResponseStats returns a snapshot of forged response counters.
+func (s *PerQueryUDPConn) ForgedResponseStats() ForgedStats {
+	return ForgedStats{
+		SERVFAIL: atomic.LoadInt64(&s.forgedSERVFAIL),
+		NXDOMAIN: atomic.LoadInt64(&s.forgedNXDOMAIN),
+		Other:    atomic.LoadInt64(&s.forgedOther),
+		Valid:    atomic.LoadInt64(&s.validCount),
+	}
+}
+
+func (s *PerQueryUDPConn) LocalAddr() net.Addr                { return nil }
+func (s *PerQueryUDPConn) SetDeadline(t time.Time) error      { return nil }
+func (s *PerQueryUDPConn) SetReadDeadline(t time.Time) error  { return nil }
+func (s *PerQueryUDPConn) SetWriteDeadline(t time.Time) error { return nil }
+
+// ---------------------------------------------------------------------------
+// SinglePerQueryUDPConn — per-query sockets for a single resolver
+// ---------------------------------------------------------------------------
+
+// SinglePerQueryUDPConn is like PerQueryUDPConn but for a single resolver.
+// Avoids the overhead of multi-resolver health tracking.
+type SinglePerQueryUDPConn struct {
+	addr      *net.UDPAddr
+	workCh    chan []byte
+	recvCh    chan udpResponse
+	closeCh   chan struct{}
+	closeOnce sync.Once
+	wg        sync.WaitGroup
+
+	forgedSERVFAIL int64
+	forgedNXDOMAIN int64
+	forgedOther    int64
+	validCount     int64
+}
+
+// NewSinglePerQueryUDPConn creates a per-query UDP conn for a single resolver.
+func NewSinglePerQueryUDPConn(addr *net.UDPAddr) *SinglePerQueryUDPConn {
+	s := &SinglePerQueryUDPConn{
+		addr:    addr,
+		workCh:  make(chan []byte, 256),
+		recvCh:  make(chan udpResponse, 256),
+		closeCh: make(chan struct{}),
+	}
+	s.wg.Add(udpWorkers)
+	for i := 0; i < udpWorkers; i++ {
+		go s.worker()
+	}
+	return s
+}
+
+func (s *SinglePerQueryUDPConn) worker() {
+	defer s.wg.Done()
+	for {
+		select {
+		case payload, ok := <-s.workCh:
+			if !ok {
+				return
+			}
+			s.handleQuery(payload)
+		case <-s.closeCh:
+			return
 		}
 	}
-	return n, addr, err
 }
 
-func (s *SmartUDPConn) Close() error {
-	s.tracker.close()
-	return s.conn.Close()
+func (s *SinglePerQueryUDPConn) handleQuery(payload []byte) {
+	conn, err := net.DialUDP("udp", nil, s.addr)
+	if err != nil {
+		return
+	}
+	defer conn.Close()
+
+	_, err = conn.Write(payload)
+	if err != nil {
+		return
+	}
+
+	conn.SetReadDeadline(time.Now().Add(udpReadTimeout))
+	var buf [4096]byte
+	n, err := conn.Read(buf[:])
+	if err != nil {
+		return
+	}
+
+	// Track RCODE stats for observability.
+	if n >= 4 {
+		rcode := int(buf[3]) & 0x0f
+		switch rcode {
+		case dns.RcodeServerFailure:
+			atomic.AddInt64(&s.forgedSERVFAIL, 1)
+		case dns.RcodeNameError:
+			atomic.AddInt64(&s.forgedNXDOMAIN, 1)
+		case dns.RcodeNoError:
+			atomic.AddInt64(&s.validCount, 1)
+		default:
+			atomic.AddInt64(&s.forgedOther, 1)
+		}
+	}
+
+	resp := udpResponse{
+		data: make([]byte, n),
+		n:    n,
+		addr: s.addr,
+	}
+	copy(resp.data, buf[:n])
+	select {
+	case s.recvCh <- resp:
+	case <-s.closeCh:
+	}
 }
 
-func (s *SmartUDPConn) LocalAddr() net.Addr                { return s.conn.LocalAddr() }
-func (s *SmartUDPConn) SetDeadline(t time.Time) error      { return s.conn.SetDeadline(t) }
-func (s *SmartUDPConn) SetReadDeadline(t time.Time) error  { return s.conn.SetReadDeadline(t) }
-func (s *SmartUDPConn) SetWriteDeadline(t time.Time) error { return s.conn.SetWriteDeadline(t) }
+func (s *SinglePerQueryUDPConn) WriteTo(p []byte, _ net.Addr) (int, error) {
+	payload := make([]byte, len(p))
+	copy(payload, p)
+	select {
+	case s.workCh <- payload:
+		return len(p), nil
+	case <-s.closeCh:
+		return 0, net.ErrClosed
+	}
+}
+
+func (s *SinglePerQueryUDPConn) ReadFrom(p []byte) (int, net.Addr, error) {
+	select {
+	case resp, ok := <-s.recvCh:
+		if !ok {
+			return 0, nil, net.ErrClosed
+		}
+		return copy(p, resp.data), resp.addr, nil
+	case <-s.closeCh:
+		return 0, nil, net.ErrClosed
+	}
+}
+
+func (s *SinglePerQueryUDPConn) Close() error {
+	s.closeOnce.Do(func() {
+		close(s.closeCh)
+		s.wg.Wait()
+		close(s.recvCh)
+	})
+	return nil
+}
+
+func (s *SinglePerQueryUDPConn) LocalAddr() net.Addr                { return nil }
+func (s *SinglePerQueryUDPConn) SetDeadline(t time.Time) error      { return nil }
+func (s *SinglePerQueryUDPConn) SetReadDeadline(t time.Time) error  { return nil }
+func (s *SinglePerQueryUDPConn) SetWriteDeadline(t time.Time) error { return nil }
 
 // ---------------------------------------------------------------------------
 // AddrNormConn — unchanged

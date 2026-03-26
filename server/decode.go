@@ -1,6 +1,6 @@
-// Package server provides the NoizDNS server-side decoding hooks.
-// It plugs into the dnstt server library to add base36/hex encoding
-// auto-detection and CDN prefix stripping.
+// Package server provides backward-compatible decoding hooks for the NoizDNS
+// server. It auto-detects base32 (current), base36, and hex encodings so the
+// server can accept both new and old clients.
 package server
 
 import (
@@ -16,17 +16,89 @@ import (
 
 var base32Encoding = base32.StdEncoding.WithPadding(base32.NoPadding)
 
-// containsHyphen returns true if b contains a '-' character.
-func containsHyphen(b []byte) bool {
-	for _, c := range b {
-		if c == '-' {
-			return true
+// decodePayload auto-detects the encoding used in DNS subdomain labels.
+//
+// Fast path (new clients — base32): labels contain only [a-z2-7]. A single
+// pass detects this and decodes immediately — no intermediate allocations.
+//
+// Legacy path (old clients — hex or base36): labels contain {0,1,8,9} or
+// hyphens (CDN prefixes). Falls through to hex → base36 → base32 detection.
+func decodePayload(prefix dns.Name) ([]byte, error) {
+	// Single pass: check if any label contains characters that cannot
+	// appear in base32 ([a-z2-7]). {0,1,8,9} and hyphens indicate
+	// legacy hex/base36 encoding with possible CDN prefixes.
+	legacy := false
+	for _, label := range prefix {
+		for _, c := range label {
+			if c == '-' || c == '0' || c == '1' || c == '8' || c == '9' {
+				legacy = true
+				break
+			}
+		}
+		if legacy {
+			break
 		}
 	}
-	return false
+
+	// Fast path: standard base32 (all new clients).
+	if !legacy {
+		encoded := bytes.ToUpper(bytes.Join(prefix, nil))
+		payload := make([]byte, base32Encoding.DecodedLen(len(encoded)))
+		n, err := base32Encoding.Decode(payload, encoded)
+		if err != nil {
+			return nil, fmt.Errorf("base32 decoding: %v", err)
+		}
+		return payload[:n], nil
+	}
+
+	// Legacy path: strip CDN prefix labels (contain hyphens), then try
+	// hex → base36 → base32 fallback. Only reached by old clients.
+	return decodeLegacy(prefix)
 }
 
-// isAllHex returns true if every byte in b is a valid lowercase hex character.
+// decodeLegacy handles old NoizDNS clients that use hex or base36 encoding
+// with optional CDN prefix labels.
+func decodeLegacy(prefix dns.Name) ([]byte, error) {
+	// Filter labels: separate data labels from CDN prefix labels.
+	// CDN prefixes contain hyphens; data labels are alphanumeric.
+	var dataLabels [][]byte
+	for _, label := range prefix {
+		lbl := bytes.ToLower(label)
+		if len(lbl) > 0 && bytes.IndexByte(lbl, '-') < 0 {
+			dataLabels = append(dataLabels, lbl)
+		}
+	}
+
+	if len(dataLabels) == 0 {
+		return nil, fmt.Errorf("no data labels found")
+	}
+
+	joined := bytes.Join(dataLabels, nil)
+
+	// Try hex: if all data bytes are [0-9a-f] and contain {0,1,8,9}.
+	if isAllHex(joined) && hasHexIndicator(joined) {
+		if payload, err := hex.DecodeString(string(joined)); err == nil {
+			return payload, nil
+		}
+	}
+
+	// Try base36: requires both [g-z] (not hex) and {0,1,8,9} (not base32).
+	if hasNonHexAlpha(joined) && hasHexIndicator(joined) {
+		if payload, err := base36Decode(string(joined)); err == nil {
+			return payload, nil
+		}
+	}
+
+	// Fallback: base32.
+	encoded := bytes.ToUpper(bytes.Join(prefix, nil))
+	payload := make([]byte, base32Encoding.DecodedLen(len(encoded)))
+	n, err := base32Encoding.Decode(payload, encoded)
+	if err != nil {
+		return nil, fmt.Errorf("base32 decoding: %v", err)
+	}
+	return payload[:n], nil
+}
+
 func isAllHex(b []byte) bool {
 	for _, c := range b {
 		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
@@ -36,17 +108,6 @@ func isAllHex(b []byte) bool {
 	return len(b) > 0
 }
 
-// isAllAlphaNum returns true if every byte is [0-9a-z].
-func isAllAlphaNum(b []byte) bool {
-	for _, c := range b {
-		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'z')) {
-			return false
-		}
-	}
-	return len(b) > 0
-}
-
-// hasNonHexAlpha returns true if any byte is in [g-z].
 func hasNonHexAlpha(b []byte) bool {
 	for _, c := range b {
 		if c >= 'g' && c <= 'z' {
@@ -56,8 +117,6 @@ func hasNonHexAlpha(b []byte) bool {
 	return false
 }
 
-// hasHexIndicator returns true if the data contains any of {0,1,8,9}
-// which never appear in base32 (a-z, 2-7).
 func hasHexIndicator(b []byte) bool {
 	for _, c := range b {
 		if c == '0' || c == '1' || c == '8' || c == '9' {
@@ -67,8 +126,6 @@ func hasHexIndicator(b []byte) bool {
 	return false
 }
 
-// base36Decode decodes a base36 string back to binary.
-// Expects a 0x01 marker byte prefix (added by the encoder to preserve leading zeros).
 func base36Decode(s string) ([]byte, error) {
 	n, ok := new(big.Int).SetString(s, 36)
 	if !ok {
@@ -81,77 +138,7 @@ func base36Decode(s string) ([]byte, error) {
 	return b[1:], nil
 }
 
-// decodePayload auto-detects the encoding used in DNS subdomain labels:
-//
-//   - base36 (NoizDNS v2): labels [0-9a-z], CDN prefixes have hyphens
-//   - hex    (NoizDNS v1): labels [0-9a-f], CDN prefixes are short non-hex words
-//   - base32 (dnstt):      labels [a-z2-7], no CDN prefixes
-//
-// Detection order:
-//  1. Skip hyphenated labels (new CDN prefixes)
-//  2. From remaining, extract hex-only labels → try hex decode
-//  3. If hex fails and data has [g-z] + [0189] → try base36
-//  4. Fallback → base32
-func decodePayload(prefix dns.Name) ([]byte, error) {
-	// Step 1: Filter out labels with hyphens (new-style CDN prefixes).
-	var noHyphenLabels [][]byte
-	for _, label := range prefix {
-		lbl := bytes.ToLower(label)
-		if !containsHyphen(lbl) && len(lbl) > 0 {
-			noHyphenLabels = append(noHyphenLabels, lbl)
-		}
-	}
-
-	// Step 2: Try hex — filter out non-hex labels (old CDN prefixes like "cdn", "img").
-	var hexLabels [][]byte
-	for _, lbl := range noHyphenLabels {
-		if isAllHex(lbl) {
-			hexLabels = append(hexLabels, lbl)
-		}
-	}
-	if len(hexLabels) > 0 {
-		hexJoined := bytes.Join(hexLabels, nil)
-		if hasHexIndicator(hexJoined) {
-			payload, err := hex.DecodeString(string(hexJoined))
-			if err == nil {
-				return payload, nil
-			}
-		}
-	}
-
-	// Step 3: Try base36 — requires both [g-z] AND [0189] to distinguish from base32.
-	// base32 uses [a-z2-7] so it never has [0189]. base36 almost always does.
-	if len(noHyphenLabels) > 0 {
-		// Only include alphanumeric labels (skip any remaining garbage).
-		var alphaNumLabels [][]byte
-		for _, lbl := range noHyphenLabels {
-			if isAllAlphaNum(lbl) {
-				alphaNumLabels = append(alphaNumLabels, lbl)
-			}
-		}
-		if len(alphaNumLabels) > 0 {
-			joined := bytes.Join(alphaNumLabels, nil)
-			if hasNonHexAlpha(joined) && hasHexIndicator(joined) {
-				payload, err := base36Decode(string(joined))
-				if err == nil {
-					return payload, nil
-				}
-			}
-		}
-	}
-
-	// Step 4: base32 fallback (standard dnstt).
-	encoded := bytes.ToUpper(bytes.Join(prefix, nil))
-	payload := make([]byte, base32Encoding.DecodedLen(len(encoded)))
-	n, err := base32Encoding.Decode(payload, encoded)
-	if err != nil {
-		return nil, fmt.Errorf("base32 decoding: %v", err)
-	}
-	return payload[:n], nil
-}
-
-// NewHooks returns ServerHooks that enable NoizDNS decoding on the dnstt server.
-// Only DecodePayload is overridden; AcceptQueryType defaults to TXT.
+// NewHooks returns ServerHooks with backward-compatible decoding.
 func NewHooks() *serverlib.ServerHooks {
 	return &serverlib.ServerHooks{
 		DecodePayload: decodePayload,

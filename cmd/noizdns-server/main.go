@@ -1,6 +1,5 @@
-// noizdns-server is the NoizDNS-enabled dnstt server. It auto-detects both
-// standard dnstt (base32) and NoizDNS (hex + CDN camouflage) clients,
-// serving them simultaneously through a single endpoint.
+// noizdns-server is the NoizDNS dnstt server. It accepts both standard
+// base32 (current clients) and legacy hex/base36 (old clients).
 package main
 
 import (
@@ -206,9 +205,6 @@ func main() {
 			}
 		}
 
-		// NoizDNS hooks: auto-detect hex/base32, accept A/AAAA, handle poll responses.
-		hooks := noizdns.NewHooks()
-
 		connections := make([]net.PacketConn, 0)
 		for _, bindaddr := range ptInfo.Bindaddrs {
 			if bindaddr.MethodName != ptMethodName {
@@ -236,6 +232,10 @@ func main() {
 			defer func() {
 				_ = dnsConn.Close()
 			}()
+
+			// Backward-compatible hooks: accepts base32 (fast path for new
+			// clients) and auto-detects hex/base36 (legacy clients).
+			hooks := noizdns.NewHooks()
 
 			go func() {
 				err := serverlib.Run(privkey, domain, upstream, dnsConn, maxUDPPayload, hooks)

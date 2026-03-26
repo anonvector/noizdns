@@ -41,8 +41,10 @@ const idleTimeout = 2 * time.Minute
 // Default uTLS fingerprint distribution (matches upstream default).
 const defaultUTLSDistribution = "4*random,3*Firefox_120,1*Firefox_105,3*Chrome_120,1*Chrome_102,1*iOS_14,1*iOS_13"
 
-// numPadding matches the constant in dnstt-client/lib/dns.go.
-const numPadding = 3
+// numPadding is the per-query padding overhead used in the MTU calculation.
+// Data queries don't need random padding because the payload itself varies;
+// poll queries still get their own nonce inside the upstream codec.
+const numPadding = 0
 
 // DnsttClient wraps a DNSTT tunnel client with Start/Stop lifecycle.
 type DnsttClient struct {
@@ -55,29 +57,24 @@ type DnsttClient struct {
 	// resolvers (more senders, larger poll burst, faster KCP, bigger buffers).
 	authoritativeMode bool
 
-	// noizMode enables NoizDNS evasion features: hex encoding, shorter
-	// labels, CDN prefix camouflage, and cover traffic.
-	noizMode bool
-
-	// stealthMode (requires noizMode) trades throughput for DPI resistance:
-	// 200-800ms jitter, aggressive cover traffic, slow polling, conservative
-	// KCP, fewer concurrent streams.
-	stealthMode bool
-
 	// maxPayload caps the KCP MTU (bytes per DNS query payload).
 	// 0 = use full capacity (default). Lower values produce smaller,
 	// less conspicuous DNS queries at the cost of throughput.
 	maxPayload int
+
+	// edns0Size overrides the EDNS(0) UDP payload size advertised in queries.
+	// 0 = 1232 (default, RFC 8020). Configurable via SetEDNS0Size.
+	edns0Size int
+
+	// deviceManufacturer is used to filter cover traffic domains that
+	// Chinese OEM ROMs (MIUI, EMUI) intercept.
+	deviceManufacturer string
 
 	// utlsDistribution overrides the default uTLS fingerprint distribution.
 	// Empty string = use default. "none" = disable uTLS.
 	// Single value (e.g. "Chrome_120") = use that exact fingerprint every time.
 	// Weighted (e.g. "3*Chrome_120,1*Firefox_120") = random from distribution.
 	utlsDistribution string
-
-	// deviceManufacturer is passed to NoizDNS so cover traffic can skip
-	// domains that Chinese OEM ROMs (MIUI, EMUI) intercept.
-	deviceManufacturer string
 
 	// socksUser/socksPass are injected automatically during the SOCKS5
 	// handshake so clients (browsers, curl) never need to provide credentials.
@@ -141,33 +138,26 @@ func (c *DnsttClient) SetAuthoritativeMode(enabled bool) {
 	c.authoritativeMode = enabled
 }
 
-// SetNoizMode enables or disables NoizDNS DPI-evasion features:
-// hex encoding (instead of base32), variable-length labels (instead of 63),
-// CDN prefix camouflage, and cover traffic with real domain queries.
-//
-// Must be called before Start.
-func (c *DnsttClient) SetNoizMode(enabled bool) {
-	c.noizMode = enabled
-}
+// SetNoizMode is a no-op kept for Android API compatibility.
+// Deprecated: noizdns encoding was removed; all clients use standard base32.
+func (c *DnsttClient) SetNoizMode(enabled bool) {}
 
-// SetStealthMode enables or disables stealth mode (requires NoizMode).
-// Trades throughput for DPI resistance:
-//   - 200-800ms random jitter before each send
-//   - Aggressive cover traffic (2-5s interval)
-//   - Slow polling (2s init, 15s max, burst of 4)
-//   - Conservative KCP (no fast retransmit, small windows)
-//   - Max 8 concurrent streams
-//
-// Must be called before Start.
-func (c *DnsttClient) SetStealthMode(enabled bool) {
-	c.stealthMode = enabled
-}
+// SetStealthMode is a no-op kept for Android API compatibility.
+// Deprecated: stealth mode was removed along with noizdns encoding.
+func (c *DnsttClient) SetStealthMode(enabled bool) {}
 
 // SetMaxPayload caps the per-query payload size (KCP MTU) to produce
 // smaller, less conspicuous DNS queries. 0 = use full capacity (default).
 // Must be called before Start.
 func (c *DnsttClient) SetMaxPayload(size int) {
 	c.maxPayload = size
+}
+
+// SetEDNS0Size overrides the EDNS(0) UDP payload size advertised in DNS queries.
+// This controls the maximum response size the server will send back.
+// 0 = 1232 (default, RFC 8020). Must be called before Start.
+func (c *DnsttClient) SetEDNS0Size(size int) {
+	c.edns0Size = size
 }
 
 // SetUTLSFingerprint overrides the uTLS fingerprint selection.
@@ -182,7 +172,7 @@ func (c *DnsttClient) SetUTLSFingerprint(fingerprint string) {
 }
 
 // SetDeviceManufacturer provides the device manufacturer string (e.g. "Xiaomi")
-// so NoizDNS can filter cover domains that Chinese OEM ROMs intercept.
+// so cover traffic can skip domains that Chinese OEM ROMs intercept.
 // Must be called before Start.
 func (c *DnsttClient) SetDeviceManufacturer(manufacturer string) {
 	c.deviceManufacturer = manufacturer
@@ -481,19 +471,17 @@ func (c *DnsttClient) Start() error {
 		} else {
 			addrs := strings.Split(c.dnsAddr, ",")
 			if len(addrs) == 1 {
-				// Single resolver — original behavior, no wrapping.
-				remoteAddr, err = net.ResolveUDPAddr("udp", strings.TrimSpace(addrs[0]))
-				if err != nil {
+				// Single resolver — per-query sockets for source port randomization.
+				udpAddr, rErr := net.ResolveUDPAddr("udp", strings.TrimSpace(addrs[0]))
+				if rErr != nil {
 					cancel()
-					return fmt.Errorf("resolving UDP address: %v", err)
+					return fmt.Errorf("resolving UDP address: %v", rErr)
 				}
-				pconn, err = net.ListenUDP("udp", nil)
-				if err != nil {
-					cancel()
-					return fmt.Errorf("opening UDP socket: %v", err)
-				}
+				pconn = NewSinglePerQueryUDPConn(udpAddr)
+				remoteAddr = turbotunnel.DummyAddr{}
+				log.Printf("single-resolver UDP: per-query sockets")
 			} else {
-				// Multiple resolvers — broadcast every query to all, first response wins.
+				// Multiple resolvers — per-query sockets, fan out to all alive.
 				var udpAddrs []*net.UDPAddr
 				for _, a := range addrs {
 					addr, rErr := net.ResolveUDPAddr("udp", strings.TrimSpace(a))
@@ -503,21 +491,16 @@ func (c *DnsttClient) Start() error {
 					}
 					udpAddrs = append(udpAddrs, addr)
 				}
-				sconn, sErr := NewSmartUDPConn(udpAddrs)
-				if sErr != nil {
-					cancel()
-					return fmt.Errorf("opening UDP socket: %v", sErr)
-				}
-				pconn = sconn
+				pconn = NewPerQueryUDPConn(udpAddrs)
 				remoteAddr = turbotunnel.DummyAddr{}
-				log.Printf("multi-resolver UDP: %d resolvers (smart)", len(udpAddrs))
+				log.Printf("multi-resolver UDP: %d resolvers (per-query sockets)", len(udpAddrs))
 			}
 		}
 	}
 
 	// Save the raw transport conn so we can close it explicitly. The
 	// wrapping layers (DNSPacketConn, AddrNormConn) don't propagate
-	// Close to the underlying transport, so SmartUDPConn/SmartMultiPacketConn
+	// Close to the underlying transport, so PerQueryUDPConn/SmartMultiPacketConn
 	// would leak their healthLoop goroutine without this.
 	transportConn := pconn
 	c.transportConn = pconn // also store on struct so Stop() can close it immediately
@@ -527,33 +510,40 @@ func (c *DnsttClient) Start() error {
 	if c.authoritativeMode {
 		// Aggressive: faster polling for lower latency
 		dnsConfig = &dnsttclient.DNSPacketConnConfig{
-			PollLimit:     16,
+			PollLimit:     12,
 			InitPollDelay: 200 * time.Millisecond,
 			MaxPollDelay:  4 * time.Second,
-		}
-	} else if c.noizMode && c.stealthMode {
-		// Stealth: slightly slower polling than normal to reduce fingerprint,
-		// but fast enough to keep KCP handshakes and ACKs responsive.
-		dnsConfig = &dnsttclient.DNSPacketConnConfig{
-			PollLimit:     10,
-			InitPollDelay: 250 * time.Millisecond,
-			MaxPollDelay:  5 * time.Second,
-		}
-	} else if c.noizMode {
-		// NoizMode: faster polling for responsive data transfer while
-		// still blending with normal DNS traffic on ISP resolvers.
-		dnsConfig = &dnsttclient.DNSPacketConnConfig{
-			PollLimit:     12,
-			InitPollDelay: 150 * time.Millisecond,
-			MaxPollDelay:  4 * time.Second,
+			EDNS0Size:     c.edns0Size,
 		}
 	} else {
-		dnsConfig = &dnsttclient.DNSPacketConnConfig{PollLimit: 8}
+		edns0 := c.edns0Size
+		if edns0 == 0 {
+			edns0 = 1232 // RFC 8020 — blends with normal DNS clients
+		}
+		dnsConfig = &dnsttclient.DNSPacketConnConfig{
+			PollLimit:    8,
+			MaxPollDelay: 30 * time.Second,
+			PollJitter:   true,
+			BurstMode:    true,
+			EDNS0Size:    edns0,
+		}
 	}
-	if c.noizMode && c.stealthMode {
-		pconn = noizdns.NewNoizDNSPacketConnStealth(pconn, remoteAddr, domain, dnsConfig, c.deviceManufacturer)
-	} else if c.noizMode {
-		pconn = noizdns.NewNoizDNSPacketConn(pconn, remoteAddr, domain, dnsConfig, c.deviceManufacturer)
+
+	// Cover traffic: send real DNS queries through the same transport to
+	// dilute the traffic analysis signal. Only for non-authoritative mode
+	// (public resolvers where DPI is a concern).
+	if !c.authoritativeMode {
+		coverDomains := noizdns.FilterCoverDomains(noizdns.DefaultCoverDomains, c.deviceManufacturer)
+		if len(coverDomains) > 0 {
+			hooks := &dnsttclient.DNSPacketConnHooks{
+				OnStart: func(transport net.PacketConn, addr net.Addr) {
+					go noizdns.CoverTrafficLoop(coverDomains, transport, addr, 15*time.Second, 45*time.Second)
+				},
+			}
+			pconn = dnsttclient.NewDNSPacketConnWithHooks(pconn, remoteAddr, domain, dnsConfig, hooks)
+		} else {
+			pconn = dnsttclient.NewDNSPacketConnWithConfig(pconn, remoteAddr, domain, dnsConfig)
+		}
 	} else {
 		pconn = dnsttclient.NewDNSPacketConnWithConfig(pconn, remoteAddr, domain, dnsConfig)
 	}
@@ -625,15 +615,24 @@ func (c *DnsttClient) IsRunning() bool {
 }
 
 // dnsNameCapacity returns the number of bytes remaining for encoded data after
-// including domain in a DNS name.
+// including domain in a DNS name, using the full 255-byte QNAME limit.
 func dnsNameCapacity(domain dns.Name) int {
-	capacity := 255
-	capacity -= 1
+	return dnsNameCapacityWithLimit(domain, 255)
+}
+
+// dnsNameCapacityWithLimit is like dnsNameCapacity but allows a custom QNAME
+// length limit. Shorter QNAMEs look more like normal DNS traffic.
+func dnsNameCapacityWithLimit(domain dns.Name, maxQNAMELen int) int {
+	capacity := maxQNAMELen
+	capacity -= 1 // null terminator
 	for _, label := range domain {
 		capacity -= len(label) + 1
 	}
-	capacity = capacity * 63 / 64
-	capacity = capacity * 5 / 8
+	if capacity < 0 {
+		return 0
+	}
+	capacity = capacity * 63 / 64 // label length overhead
+	capacity = capacity * 5 / 8   // base32 expansion
 	return capacity
 }
 
@@ -1017,14 +1016,21 @@ func (c *DnsttClient) run(ctx context.Context, pubkey []byte, domain dns.Name, l
 		ln.Close()
 	}()
 
-	var mtu int
-	if c.noizMode {
-		mtu = noizdns.DnsNameCapacityNoiz(domain) - 8 - 1 - numPadding - 1
+	// Non-authoritative mode uses a shorter QNAME (150 bytes vs 255) so
+	// queries look more like normal DNS traffic on restrictive networks.
+	var nameCapacity int
+	if c.authoritativeMode {
+		nameCapacity = dnsNameCapacity(domain)
 	} else {
+		nameCapacity = dnsNameCapacityWithLimit(domain, 150)
+	}
+	mtu := nameCapacity - 8 - 1 - numPadding - 1
+	if mtu < 80 {
+		// Fall back to full capacity if the domain is too long for the short limit.
 		mtu = dnsNameCapacity(domain) - 8 - 1 - numPadding - 1
 	}
 	if mtu < 80 {
-		return fmt.Errorf("domain %s leaves only %d bytes for payload", domain, mtu)
+		return fmt.Errorf("domain %s leaves only %d bytes for payload (MTU %d); try using a shorter tunnel domain", domain, mtu)
 	}
 	if c.maxPayload >= 50 && c.maxPayload < mtu {
 		log.Printf("capping MTU from %d to %d (maxPayload)", mtu, c.maxPayload)
@@ -1056,17 +1062,7 @@ func (c *DnsttClient) run(ctx context.Context, pubkey []byte, domain dns.Name, l
 		conn.SetNoDelay(1, 20, 2, 1)
 		conn.SetACKNoDelay(true)
 		conn.SetWindowSize(256, 256)
-	} else if c.noizMode && c.stealthMode {
-		// Stealth: fast retransmit with moderate windows.
-		conn.SetNoDelay(1, 40, 2, 1)
-		conn.SetWindowSize(128, 128)
-	} else if c.noizMode {
-		// NoizMode via resolver: fast flush + fast retransmit + no congestion control.
-		conn.SetNoDelay(1, 30, 2, 1)
-		conn.SetACKNoDelay(true)
-		conn.SetWindowSize(192, 192)
 	} else {
-		// Conservative: upstream KCP defaults
 		conn.SetNoDelay(0, 0, 0, 1)
 		conn.SetWindowSize(64, 64)
 	}
@@ -1085,15 +1081,13 @@ func (c *DnsttClient) run(ctx context.Context, pubkey []byte, domain dns.Name, l
 	smuxConfig.KeepAliveTimeout = idleTimeout
 	if c.authoritativeMode {
 		// Aggressive: larger buffers for better throughput
-		smuxConfig.MaxStreamBuffer = 4 * 1024 * 1024  // 4MB (default 64KB)
+		smuxConfig.MaxStreamBuffer = 4 * 1024 * 1024   // 4MB (default 64KB)
 		smuxConfig.MaxReceiveBuffer = 16 * 1024 * 1024 // 16MB (default 4MB)
-	} else if c.noizMode && c.stealthMode {
-		// Stealth: moderate buffers
-		smuxConfig.MaxStreamBuffer = 512 * 1024  // 512KB
-	} else if c.noizMode {
-		// NoizDNS: larger buffers to reduce stalls on page loads
-		smuxConfig.MaxStreamBuffer = 1 * 1024 * 1024   // 1MB (default 64KB)
-		smuxConfig.MaxReceiveBuffer = 16 * 1024 * 1024  // 16MB (default 4MB)
+	} else {
+		// Reduce smux keepalive frequency to save battery/data.
+		// Default is 10s which generates a DNS query every 10s even when idle.
+		// 30s is enough to keep the session alive without excessive radio wakes.
+		smuxConfig.KeepAliveInterval = 30 * time.Second
 	}
 	sess, err := smux.Client(rw, smuxConfig)
 	if err != nil {
@@ -1111,30 +1105,43 @@ func (c *DnsttClient) run(ctx context.Context, pubkey []byte, domain dns.Name, l
 	// Browsers open 20-40+ connections per page; without a cap each becomes
 	// a smux stream that floods the bandwidth-constrained DNS tunnel.
 	var streamSem chan struct{}
-	if c.noizMode && c.stealthMode {
-		streamSem = make(chan struct{}, 16) // stealth: moderate concurrent streams
-	} else if c.noizMode {
-		streamSem = make(chan struct{}, 20)
-	} else if !c.authoritativeMode {
+	if !c.authoritativeMode {
 		streamSem = make(chan struct{}, 32)
 	}
 	// authoritativeMode: no limit (high-bandwidth self-hosted resolver)
 
+	sessDone := sess.CloseChan()
+
 	for {
+		// Set a deadline so Accept unblocks periodically for session
+		// health checks. Without this, a dead session isn't detected
+		// until the next incoming connection (could be minutes).
+		ln.SetDeadline(time.Now().Add(2 * time.Second))
 		local, err := ln.Accept()
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil // Shutdown requested.
+			}
+			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				// Check if session died while we were waiting.
+				select {
+				case <-sessDone:
+					return fmt.Errorf("session %08x closed", conn.GetConv())
+				default:
+					continue
+				}
 			}
 			if err, ok := err.(net.Error); ok && err.Temporary() {
 				continue
 			}
 			return err
 		}
-		// Stop accepting if the tunnel session is dead.
-		if sess.IsClosed() {
+		// Check between accepted connections too.
+		select {
+		case <-sessDone:
 			local.Close()
 			return fmt.Errorf("session %08x closed", conn.GetConv())
+		default:
 		}
 		// Non-blocking: reject immediately if at capacity.
 		// Keeps the accept loop responsive for other connections.
