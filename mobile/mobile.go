@@ -66,6 +66,10 @@ type DnsttClient struct {
 	// 0 = 1232 (default, RFC 8020). Configurable via SetEDNS0Size.
 	edns0Size int
 
+	// stealthMode enables variable-length label splitting and aggressive
+	// cover traffic. Trades throughput for DPI resistance.
+	stealthMode bool
+
 	// deviceManufacturer is used to filter cover traffic domains that
 	// Chinese OEM ROMs (MIUI, EMUI) intercept.
 	deviceManufacturer string
@@ -142,9 +146,15 @@ func (c *DnsttClient) SetAuthoritativeMode(enabled bool) {
 // Deprecated: noizdns encoding was removed; all clients use standard base32.
 func (c *DnsttClient) SetNoizMode(enabled bool) {}
 
-// SetStealthMode is a no-op kept for Android API compatibility.
-// Deprecated: stealth mode was removed along with noizdns encoding.
-func (c *DnsttClient) SetStealthMode(enabled bool) {}
+// SetStealthMode enables variable-length DNS label splitting and aggressive
+// cover traffic. Queries use randomized label sizes (15-40 chars) instead of
+// the fixed 63-byte labels that DPI fingerprints. Data queries also get random
+// padding to vary QNAME length. Cover traffic interval drops to 5-15s.
+// Throughput is slightly lower (~10%) due to label overhead.
+// Must be called before Start.
+func (c *DnsttClient) SetStealthMode(enabled bool) {
+	c.stealthMode = enabled
+}
 
 // SetMaxPayload caps the per-query payload size (KCP MTU) to produce
 // smaller, less conspicuous DNS queries. 0 = use full capacity (default).
@@ -529,21 +539,41 @@ func (c *DnsttClient) Start() error {
 		}
 	}
 
-	// Cover traffic: send real DNS queries through the same transport to
-	// dilute the traffic analysis signal. Only for non-authoritative mode
-	// (public resolvers where DPI is a concern).
+	// Cover traffic and optional stealth encoding. Only for non-authoritative
+	// mode (public resolvers where DPI is a concern).
 	if !c.authoritativeMode {
 		coverDomains := noizdns.FilterCoverDomains(noizdns.DefaultCoverDomains, c.deviceManufacturer)
-		if len(coverDomains) > 0 {
-			hooks := &dnsttclient.DNSPacketConnHooks{
-				OnStart: func(transport net.PacketConn, addr net.Addr) {
-					go noizdns.CoverTrafficLoop(coverDomains, transport, addr, 15*time.Second, 45*time.Second)
-				},
-			}
-			pconn = dnsttclient.NewDNSPacketConnWithHooks(pconn, remoteAddr, domain, dnsConfig, hooks)
-		} else {
-			pconn = dnsttclient.NewDNSPacketConnWithConfig(pconn, remoteAddr, domain, dnsConfig)
+		// Cover traffic intervals: stealth uses aggressive 5-15s, normal uses 15-45s.
+		coverMin, coverMax := 15*time.Second, 45*time.Second
+		if c.stealthMode {
+			coverMin, coverMax = 5*time.Second, 15*time.Second
 		}
+
+		hooks := &dnsttclient.DNSPacketConnHooks{}
+		if len(coverDomains) > 0 {
+			cMin, cMax := coverMin, coverMax
+			hooks.OnStart = func(transport net.PacketConn, addr net.Addr) {
+				go noizdns.CoverTrafficLoop(coverDomains, transport, addr, cMin, cMax)
+			}
+		}
+
+		// Stealth mode: replace default send with variable-length label encoding.
+		if c.stealthMode {
+			clientID := turbotunnel.NewClientID()
+			edns0 := c.edns0Size
+			if edns0 == 0 {
+				edns0 = 1232
+			}
+			sender := &noizdns.StealthSender{
+				ClientID:  clientID,
+				Domain:    domain,
+				EDNS0Size: edns0,
+			}
+			hooks.CustomSendFunc = sender.Send
+			hooks.ClientID = &clientID
+		}
+
+		pconn = dnsttclient.NewDNSPacketConnWithHooks(pconn, remoteAddr, domain, dnsConfig, hooks)
 	} else {
 		pconn = dnsttclient.NewDNSPacketConnWithConfig(pconn, remoteAddr, domain, dnsConfig)
 	}
@@ -1018,16 +1048,25 @@ func (c *DnsttClient) run(ctx context.Context, pubkey []byte, domain dns.Name, l
 
 	// Non-authoritative mode uses a shorter QNAME (150 bytes vs 255) so
 	// queries look more like normal DNS traffic on restrictive networks.
+	// Stealth mode uses variable-length labels which have slightly more
+	// overhead (15-40 char labels vs fixed 63), accounted for here.
 	var nameCapacity int
 	if c.authoritativeMode {
 		nameCapacity = dnsNameCapacity(domain)
+	} else if c.stealthMode {
+		nameCapacity = noizdns.StealthNameCapacity(domain, 150)
 	} else {
 		nameCapacity = dnsNameCapacityWithLimit(domain, 150)
 	}
 	mtu := nameCapacity - 8 - 1 - numPadding - 1
 	if mtu < 80 {
 		// Fall back to full capacity if the domain is too long for the short limit.
-		mtu = dnsNameCapacity(domain) - 8 - 1 - numPadding - 1
+		if c.stealthMode {
+			nameCapacity = noizdns.StealthNameCapacity(domain, 255)
+		} else {
+			nameCapacity = dnsNameCapacity(domain)
+		}
+		mtu = nameCapacity - 8 - 1 - numPadding - 1
 	}
 	if mtu < 80 {
 		return fmt.Errorf("domain %s leaves only %d bytes for payload (MTU %d); try using a shorter tunnel domain", domain, mtu)
