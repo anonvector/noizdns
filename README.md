@@ -1,119 +1,110 @@
 # NoizDNS
 
-DPI-evasion layer built on top of [dnstt](https://www.bamsoftware.com/software/dnstt/). Extends dnstt with advanced anti-censorship features to make DNS tunnel traffic harder to detect and block.
-
-The server auto-detects base36 (NoizDNS v2), hex (NoizDNS v1), and base32 (standard dnstt) clients simultaneously through a single endpoint.
-
-## License
-
-MIT — see [LICENSE](LICENSE).
+Anti-censorship DNS tunnel built on [dnstt](https://www.bamsoftware.com/software/dnstt/). Adds per-query source port randomization, forged response filtering, stealth label encoding, cover traffic, and multi-resolver health tracking.
 
 ## Features
 
-### Base36 Encoding
-- Encodes data using full alphanumeric charset (0-9, a-z) instead of dnstt's base32 or hex
-- Labels look like CDN cache keys or analytics tracking IDs
-- ~29% more capacity than hex, ~3% more than base32
+### Per-Query UDP (`PerQueryUDPConn`)
+- Creates a **fresh UDP socket for every outgoing DNS query**, randomizing source ports to defeat fingerprinting by source-port correlation
+- Worker pool (64 goroutines) with per-query read timeout
+- Filters forged DNS responses (SERVFAIL/NXDOMAIN injections) by reading in a loop until a valid response arrives or timeout
 
-### Variable-Length Labels
-- Splits encoded data into labels of random lengths (28-42 chars)
-- Avoids fixed-length patterns that DPI can fingerprint
-- Standard dnstt uses fixed 63-char labels
+### Multi-Resolver Health Tracking
+- Monitors per-resolver response times with dead detection (12s timeout)
+- Automatic dead resolver probing (every 15s) and recovery
+- Queries fan out to all alive resolvers; KCP deduplicates, fastest wins
 
-### CDN Prefix Camouflage
-- Prepends realistic multi-level DNS labels to queries
-- Makes tunnel queries look like real CDN/cloud endpoints
-- 15 prefix patterns (e.g., `cdn-static.prod-v1`, `img-cache.us-east-1`, `wss-proxy.region-1`)
-- All prefixes contain hyphens for reliable server-side filtering
-- Normal mode: ~25% of queries get a prefix
-- Stealth mode: 100% of queries
-
-Example query:
-```
-img-cache.us-east-1.k7m2x9nq4wp5zt8rj3hv6bc.y1da0fu8l5onge.t.example.com
-```
-
-### Cover Traffic with Page-Load Bursts
-- Sends cover queries in **bursts** that mimic Chrome page loads, not steady drip
-- Each burst: 5-15 queries in 100-500ms (A + AAAA + HTTPS for primary domain, then sub-resource lookups), then silence
-- Three domain pools: browsing domains (50%), CDN/analytics (30%), Chrome infra (20%)
-- Chrome startup burst on tunnel init (3-5 infra domain queries)
-- Background Chrome activity between bursts (Safe Browsing, update checks, ~30% chance per interval)
-- Mixes international platform domains with domestic domains reachable during internet shutdowns
-- Auto-filters domains intercepted by Chinese OEM ROMs (Xiaomi, Huawei, etc.)
-- Normal: ~15s between page-load bursts, Stealth: ~5s between bursts
-
-### Chrome-like DNS Fingerprint (cover traffic only)
-- EDNS0 UDP payload size 1452 and AD=1 flag on cover traffic queries (matches Chrome)
-- HTTPS record type (65) queries mixed in (~60% of page loads, Chrome default since ~2022)
-- A + AAAA query pairs (~80% of lookups, matching Chrome dual-stack behavior)
-- Tunnel queries use standard EDNS0 4096 and RD=1 for maximum resolver compatibility
+### Cover Traffic
+- Sends periodic legitimate DNS queries to real domains through the same transport
+- Dilutes the tunnel-to-total DNS ratio that DPI uses to identify tunnel-only resolver usage
+- Mixes international platform domains (Android/iOS background traffic) with domestic domains reachable during internet shutdowns
+- Auto-filters domains intercepted by Chinese OEM ROMs (Xiaomi, Huawei, OPPO, etc.)
 
 ### Stealth Mode
-Trades throughput for maximum DPI resistance:
-- 100% CDN prefix on all queries
-- More frequent cover traffic (3-8s)
-- Slower KCP polling (250ms init, 5s max)
-- Moderate KCP windows (128x128)
-- Max 16 concurrent streams
+Variable-length DNS label splitting that breaks the fixed 63-byte label fingerprint DPI uses to identify dnstt:
+
+```
+Normal dnstt (fixed 63-char labels):
+  ingesrkokreujy6zumkse43vobsxey3bnruwm4tbm5uwy2ltoruwgzlyobuwc3d.jmrxwg2lpovzq.t.example.com
+  └──────────────────────── always 63 ──────────────────────────────┘
+
+Stealth mode (random 15-40 char labels):
+  ingesrkokreujy6zum.kse43vobsxey3bnruwm4tbm5uwy2lto.ruwgzlyobuwc3djmrxwg2lpovzq.t.example.com
+  └────── 18 ───────┘└──────────── 31 ──────────────────┘└─────────── 27 ────────────┘
+```
+
+Same data, same base32 encoding, fully backward compatible server decoding (server just concatenates all labels). ~3% throughput cost from label overhead.
+
+Also enables aggressive cover traffic (5-15s intervals vs 15-45s normal).
+
+### Backward-Compatible Server
+The server auto-detects encoding per-query:
+- **Fast path**: base32 `[a-z2-7]` — current clients (single-pass detection)
+- **Legacy path**: hex or base36 with CDN prefix stripping — old clients
+
+### Transport Support
+Auto-detected from the DNS address format:
+- `host:port` — Plain UDP (with per-query source port randomization)
+- `tcp://host:port` — Plain TCP (2-byte length framing)
+- `tls://host:port` — DoT (DNS over TLS with uTLS fingerprinting)
+- `https://host/path` — DoH (DNS over HTTPS with uTLS fingerprinting)
+
+Multi-resolver: comma-separated addresses with health tracking and automatic failover.
 
 ## Architecture
 
 ```
 noizdns/
 ├── client/
-│   └── noizdns.go          # Client-side: base36, variable labels, CDN prefix, cover traffic
+│   ├── stealth.go        # Stealth send: variable-length label splitting
+│   └── cover.go          # Cover traffic loop and domain filtering
 ├── server/
-│   └── decode.go           # Server-side: auto-detection and decoding (base36/hex/base32)
+│   └── decode.go         # Server-side decoding (base32 fast path + legacy fallback)
 ├── mobile/
-│   ├── mobile.go           # gomobile-compatible client API (Android/iOS)
-│   └── multi.go            # Multi-resolver health tracking and round-robin
+│   ├── mobile.go         # gomobile-compatible client API (Android/iOS)
+│   └── multi.go          # PerQueryUDPConn, multi-resolver health tracking
 └── cmd/
-    └── noizdns-server/
-        └── main.go         # Pluggable transport server binary
+    ├── noizdns-server/
+    │   └── main.go       # Pluggable transport server binary
+    └── noizdns-client/
+        └── main.go       # CLI client
 ```
 
-## Server Auto-Detection
+## Client API (mobile)
 
-The server decodes any encoding automatically per-query:
+```go
+import "noizdns/mobile"
 
+client, err := mobile.NewClient(
+    "8.8.8.8:53",           // DNS resolver(s), comma-separated for multi
+    "t.example.com",        // Tunnel domain
+    "aabbccdd...",          // Server public key (hex)
+    "127.0.0.1:1080",      // Local SOCKS5 listen address
+)
+
+// Optional configuration (call before Start)
+client.SetStealthMode(true)     // Variable-length labels + aggressive cover traffic
+client.SetMaxPayload(50)        // Cap payload size for smaller queries
+client.SetAuthoritativeMode(true) // Aggressive settings for self-hosted resolvers
+client.SetEDNS0Size(1232)       // EDNS(0) UDP payload size (default: 1232)
+client.SetDeviceManufacturer("xiaomi") // Filter intercepted cover domains
+
+err = client.Start()
+defer client.Stop()
 ```
-Step 1: Skip labels with hyphens (CDN prefixes)
-Step 2: Try hex decode on [0-9a-f] labels with [0189] indicators
-Step 3: Try base36 on [0-9a-z] labels with both [g-z] AND [0189]
-Step 4: Fallback to base32 (standard dnstt)
-```
 
-Why this works:
-- **base32** uses [a-z2-7] — never has [0189]
-- **hex** uses [0-9a-f] — never has [g-z]
-- **base36** uses [0-9a-z] — almost always has both [g-z] AND [0189]
-- **CDN prefixes** have hyphens — always filtered first
+### Connection Modes
 
-## Connection Modes
-
-| Setting | Authoritative | Normal NoizDNS | Stealth | Standard dnstt |
-|---|---|---|---|---|
-| PollLimit | 16 | 12 | 10 | 8 |
-| InitPollDelay | 200ms | 150ms | 250ms | default |
-| MaxPollDelay | 4s | 4s | 5s | default |
-| KCP Flush | 20ms | 30ms | 40ms | default |
-| KCP Window | 256x256 | 192x192 | 128x128 | 64x64 |
-| ACK NoDelay | yes | yes | no | no |
-| Max Streams | unlimited | 20 | 16 | 32 |
-| CDN Prefix | N/A | 25% | 100% | N/A |
-| Cover Bursts | N/A | ~15s apart | ~5s apart | N/A |
-| Background | N/A | ~45s | ~10s | N/A |
-
-## Transport Support
-
-The client auto-detects transport from the DNS address format:
-- `host:port` — Plain UDP
-- `tcp://host:port` — Plain TCP (2-byte framing)
-- `tls://host:port` — DoT (DNS over TLS with uTLS fingerprinting)
-- `https://host/path` — DoH (DNS over HTTPS with uTLS fingerprinting)
-
-Multi-resolver: comma-separated addresses with health tracking, round-robin, and automatic dead resolver recovery.
+| Setting | Authoritative | Normal | Stealth |
+|---|---|---|---|
+| QNAME limit | 255 bytes | 150 bytes | 150 bytes |
+| Label splitting | Fixed 63 | Fixed 63 | Random 15-40 |
+| PollLimit | 12 | 8 | 8 |
+| MaxPollDelay | 4s | 30s | 30s |
+| Poll jitter | no | yes (±30%) | yes (±30%) |
+| Burst polling | no | yes | yes |
+| Cover traffic | off | 15-45s | 5-15s |
+| EDNS(0) size | 4096 | 1232 | 1232 |
 
 ## Building
 
@@ -192,62 +183,6 @@ noizdns-server -privkey-file server.key -mtu 1232 t.example.com
 | `-pubkey-file FILE` | Write public key to file (with `-gen-key`) |
 | `-mtu SIZE` | Max UDP payload size (default: 1232) |
 
-## Client API (mobile)
-
-```go
-import "noizdns/mobile"
-
-// Create client
-client, err := mobile.NewClient(
-    "8.8.8.8:53",           // DNS resolver(s)
-    "t.example.com",         // Tunnel domain
-    "aabbccdd...",           // Server public key (hex)
-    "127.0.0.1:1080",       // Local SOCKS5 listen address
-)
-
-// Configure mode
-client.SetNoizMode(true)        // Enable NoizDNS encoding
-client.SetStealthMode(true)     // Enable stealth (requires NoizMode)
-client.SetMaxPayload(100)       // Optional: cap payload size
-
-// Start tunnel
-err = client.Start()
-
-// Stop tunnel
-client.Stop()
-```
-
-## Packet Structure
-
-```
-Upstream (client → server):
-
-  [ClientID: 8 bytes]
-  [Padding count: 1 byte (224 + n)]
-  [Padding: n random bytes]
-  [Data length: 1 byte (if data present)]
-  [Data: up to ~100 bytes]
-        ↓
-  Base36 encode (with 0x01 marker prefix)
-        ↓
-  Split into variable-length labels (28-42 chars)
-        ↓
-  Prepend CDN prefix labels (optional/always)
-        ↓
-  Append tunnel domain
-        ↓
-  DNS TXT query with EDNS0 (4096 byte UDP size, RD=1)
-```
-
-## Capacity
-
-For a domain like `t.example.com`:
-- Available DNS name space: ~220 bytes
-- After CDN prefix reservation (20 bytes): ~200 bytes
-- After label overhead: ~196 base36 chars
-- Payload capacity: ~121 bytes per query
-- Effective MTU (after headers): ~108 bytes
-
 ## Dependencies
 
 - `github.com/xtaci/kcp-go/v5` — KCP protocol
@@ -256,3 +191,7 @@ For a domain like `t.example.com`:
 - `github.com/refraction-networking/utls` — uTLS fingerprinting
 - `www.bamsoftware.com/git/dnstt.git` — Core DNS tunnel (local override)
 - `gitlab.torproject.org/.../goptlib` — Pluggable transport library
+
+## License
+
+MIT — see [LICENSE](LICENSE).
