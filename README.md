@@ -1,6 +1,16 @@
 # NoizDNS
 
-Anti-censorship DNS tunnel built on [dnstt](https://www.bamsoftware.com/software/dnstt/). Adds per-query source port randomization, forged response filtering, stealth label encoding, cover traffic, and multi-resolver health tracking.
+Anti-censorship DNS tunnel built on [dnstt](https://www.bamsoftware.com/software/dnstt/).
+
+- Cover traffic — real DNS queries to dilute tunnel ratio
+- Stealth mode — variable-length labels to break fixed-63 fingerprint
+- Multi-resolver fan-out with health tracking and dead detection
+- gomobile API for Android/iOS
+- SOCKS5 proxy chaining for transport
+- Plain TCP transport
+- Authoritative mode with KCP turbo tuning
+- Chinese OEM domain filtering for cover traffic
+- Backward-compatible server (auto-detects base32 + legacy encoding)
 
 ## Features
 

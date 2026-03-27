@@ -92,7 +92,7 @@ func main() {
 	flag.StringVar(&pubkeyFile, "pubkey-file", "", "file containing server public key hex")
 	flag.BoolVar(&enableNoiz, "noiz", false, "enable NoizDNS encoding (base36, variable labels, CDN prefixes, cover traffic)")
 	flag.BoolVar(&stealth, "stealth", false, "enable NoizDNS stealth mode (requires -noiz)")
-	flag.IntVar(&maxPayload, "max-payload", 0, "max DNS payload bytes per query (0 = full capacity)")
+	flag.IntVar(&maxPayload, "max-payload", 100, "max DNS payload bytes per query (0 = full capacity)")
 	flag.StringVar(&deviceManufacturer, "device-manufacturer", "", "device manufacturer/OEM for NoizDNS cover traffic filtering (e.g. Xiaomi)")
 
 	flag.Usage = usage

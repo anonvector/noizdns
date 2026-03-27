@@ -58,8 +58,8 @@ type DnsttClient struct {
 	authoritativeMode bool
 
 	// maxPayload caps the KCP MTU (bytes per DNS query payload).
-	// 0 = use full capacity (default). Lower values produce smaller,
-	// less conspicuous DNS queries at the cost of throughput.
+	// Default 100. Lower values produce smaller, less conspicuous DNS
+	// queries at the cost of throughput. 0 = use full capacity.
 	maxPayload int
 
 	// edns0Size overrides the EDNS(0) UDP payload size advertised in queries.
@@ -1078,9 +1078,13 @@ func (c *DnsttClient) run(ctx context.Context, pubkey []byte, domain dns.Name, l
 	if mtu < 80 {
 		return fmt.Errorf("domain %s leaves only %d bytes for payload (MTU %d); try using a shorter tunnel domain", domain, mtu)
 	}
-	if c.maxPayload >= 50 && c.maxPayload < mtu {
-		log.Printf("capping MTU from %d to %d (maxPayload)", mtu, c.maxPayload)
-		mtu = c.maxPayload
+	maxPayload := c.maxPayload
+	if maxPayload == 0 {
+		maxPayload = 100
+	}
+	if maxPayload >= 50 && maxPayload < mtu {
+		log.Printf("capping MTU from %d to %d (maxPayload)", mtu, maxPayload)
+		mtu = maxPayload
 	}
 	log.Printf("effective MTU %d", mtu)
 
