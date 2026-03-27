@@ -1,7 +1,8 @@
-// Package client provides stealth encoding and cover traffic for NoizDNS tunnels.
+// Package client provides custom DNS tunnel encoding for NoizDNS.
 //
-// StealthSender replaces the default dnstt send() with variable-length label
-// splitting and per-query random padding. This breaks the fixed 63-byte label
+// NormalSender and StealthSender replace the default dnstt send() to skip
+// random padding and maximize payload capacity. StealthSender additionally
+// uses variable-length label splitting to break the fixed 63-byte label
 // fingerprint that DPI uses to identify dnstt tunnel traffic.
 package client
 
@@ -11,7 +12,6 @@ import (
 	"encoding/base32"
 	"encoding/binary"
 	"fmt"
-	"io"
 	"net"
 
 	"www.bamsoftware.com/git/dnstt.git/dns"
@@ -22,17 +22,34 @@ var stealthBase32 = base32.StdEncoding.WithPadding(base32.NoPadding)
 
 const (
 	// stealthLabelMin/Max define the range for variable-length labels.
-	// Varying between 15-40 chars avoids the fixed 63-char pattern that
+	// Varying between 25-40 chars avoids the fixed 63-char pattern that
 	// DPI fingerprints. The labels look like CDN cache keys or analytics IDs.
-	stealthLabelMin = 15
+	stealthLabelMin = 25
 	stealthLabelMax = 40
-
-	// stealthPollPadding is the padding for empty poll queries (cache busting).
-	stealthPollPadding = 8
 )
 
-// StealthSender encodes DNS tunnel packets with variable-length labels
-// and random padding. It implements the dnstt CustomSendFunc interface.
+// NormalSender replaces the default dnstt send() with zero-padding encoding.
+// Uses fixed 63-byte labels (same as dnstt) but skips random padding to
+// maximize payload capacity.
+type NormalSender struct {
+	ClientID  turbotunnel.ClientID
+	Domain    dns.Name
+	EDNS0Size int
+}
+
+// Send encodes p into a DNS query with fixed 63-byte labels and no padding.
+func (s *NormalSender) Send(transport net.PacketConn, p []byte, addr net.Addr) error {
+	encoded, err := encodePayload(s.ClientID, p)
+	if err != nil {
+		return err
+	}
+	labels := chunks(encoded, 63)
+	labels = append(labels, s.Domain...)
+	return sendQuery(labels, s.EDNS0Size, transport, addr)
+}
+
+// StealthSender encodes DNS tunnel packets with variable-length labels.
+// It implements the dnstt CustomSendFunc interface.
 type StealthSender struct {
 	ClientID  turbotunnel.ClientID
 	Domain    dns.Name
@@ -40,82 +57,76 @@ type StealthSender struct {
 }
 
 // Send encodes p into a DNS query with variable-length labels and sends it.
-// This is a drop-in replacement for dnstt's default send() function.
 func (s *StealthSender) Send(transport net.PacketConn, p []byte, addr net.Addr) error {
+	encoded, err := encodePayload(s.ClientID, p)
+	if err != nil {
+		return err
+	}
+	labels := varChunks(encoded, stealthLabelMin, stealthLabelMax)
+	labels = append(labels, s.Domain...)
+	return sendQuery(labels, s.EDNS0Size, transport, addr)
+}
+
+// encodePayload builds the base32-encoded QNAME payload with zero padding.
+func encodePayload(clientID turbotunnel.ClientID, p []byte) ([]byte, error) {
 	if len(p) >= 224 {
-		return fmt.Errorf("too long")
+		return nil, fmt.Errorf("payload too long: %d >= 224", len(p))
 	}
-
-	// Build the raw payload: ClientID + padding header + random padding + data.
 	var buf bytes.Buffer
-	buf.Write(s.ClientID[:])
-
-	var padLen int
-	if len(p) == 0 {
-		// Poll query: fixed padding for cache busting.
-		padLen = stealthPollPadding
-	}
-	// Data queries: no extra padding needed — variable-length labels
-	// already vary the QNAME length per query.
-	buf.WriteByte(byte(224 + padLen))
-	_, _ = io.CopyN(&buf, rand.Reader, int64(padLen))
-
+	buf.Write(clientID[:])
+	buf.WriteByte(224) // zero padding
 	if len(p) > 0 {
 		buf.WriteByte(byte(len(p)))
 		buf.Write(p)
 	}
-
-	// Base32 encode.
 	decoded := buf.Bytes()
 	encoded := make([]byte, stealthBase32.EncodedLen(len(decoded)))
 	stealthBase32.Encode(encoded, decoded)
-	encoded = bytes.ToLower(encoded)
+	return bytes.ToLower(encoded), nil
+}
 
-	// Split into variable-length labels instead of fixed 63-byte chunks.
-	labels := varChunks(encoded, stealthLabelMin, stealthLabelMax)
-	labels = append(labels, s.Domain...)
+// sendQuery builds a DNS TXT query from pre-split labels and sends it.
+func sendQuery(labels dns.Name, edns0Size int, transport net.PacketConn, addr net.Addr) error {
 	name, err := dns.NewName(labels)
 	if err != nil {
 		return err
 	}
-
-	// Build DNS query.
 	var id uint16
 	_ = binary.Read(rand.Reader, binary.BigEndian, &id)
+	ec := uint16(1232)
+	if edns0Size > 0 {
+		ec = uint16(edns0Size)
+	}
 	query := &dns.Message{
 		ID:    id,
-		Flags: 0x0100, // QR = 0, RD = 1
+		Flags: 0x0100,
 		Question: []dns.Question{
-			{
-				Name:  name,
-				Type:  dns.RRTypeTXT,
-				Class: dns.ClassIN,
-			},
+			{Name: name, Type: dns.RRTypeTXT, Class: dns.ClassIN},
 		},
 		Additional: []dns.RR{
-			{
-				Name:  dns.Name{},
-				Type:  dns.RRTypeOPT,
-				Class: s.edns0Class(),
-				TTL:   0,
-				Data:  []byte{},
-			},
+			{Name: dns.Name{}, Type: dns.RRTypeOPT, Class: ec, TTL: 0, Data: []byte{}},
 		},
 	}
 	wire, err := query.WireFormat()
 	if err != nil {
 		return err
 	}
-
 	_, err = transport.WriteTo(wire, addr)
 	return err
 }
 
-func (s *StealthSender) edns0Class() uint16 {
-	if s.EDNS0Size > 0 {
-		return uint16(s.EDNS0Size)
+// chunks splits p into fixed-size pieces of at most n bytes.
+func chunks(p []byte, n int) [][]byte {
+	var result [][]byte
+	for len(p) > 0 {
+		sz := n
+		if sz > len(p) {
+			sz = len(p)
+		}
+		result = append(result, p[:sz])
+		p = p[sz:]
 	}
-	return 1232 // RFC 8020 default for stealth
+	return result
 }
 
 // varChunks splits p into labels with random lengths between minLen and maxLen.

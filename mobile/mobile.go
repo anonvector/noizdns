@@ -557,21 +557,28 @@ func (c *DnsttClient) Start() error {
 			}
 		}
 
-		// Stealth mode: replace default send with variable-length label encoding.
+		// Replace default send to skip random padding in both modes.
+		clientID := turbotunnel.NewClientID()
+		edns0 := c.edns0Size
+		if edns0 == 0 {
+			edns0 = 1232
+		}
 		if c.stealthMode {
-			clientID := turbotunnel.NewClientID()
-			edns0 := c.edns0Size
-			if edns0 == 0 {
-				edns0 = 1232
-			}
 			sender := &noizdns.StealthSender{
 				ClientID:  clientID,
 				Domain:    domain,
 				EDNS0Size: edns0,
 			}
 			hooks.CustomSendFunc = sender.Send
-			hooks.ClientID = &clientID
+		} else {
+			sender := &noizdns.NormalSender{
+				ClientID:  clientID,
+				Domain:    domain,
+				EDNS0Size: edns0,
+			}
+			hooks.CustomSendFunc = sender.Send
 		}
+		hooks.ClientID = &clientID
 
 		pconn = dnsttclient.NewDNSPacketConnWithHooks(pconn, remoteAddr, domain, dnsConfig, hooks)
 	} else {

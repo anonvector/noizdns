@@ -4,16 +4,6 @@ Anti-censorship DNS tunnel built on [dnstt](https://www.bamsoftware.com/software
 
 ## Features
 
-### Per-Query UDP (`PerQueryUDPConn`)
-- Creates a **fresh UDP socket for every outgoing DNS query**, randomizing source ports to defeat fingerprinting by source-port correlation
-- Worker pool (64 goroutines) with per-query read timeout
-- Filters forged DNS responses (SERVFAIL/NXDOMAIN injections) by reading in a loop until a valid response arrives or timeout
-
-### Multi-Resolver Health Tracking
-- Monitors per-resolver response times with dead detection (12s timeout)
-- Automatic dead resolver probing (every 15s) and recovery
-- Queries fan out to all alive resolvers; KCP deduplicates, fastest wins
-
 ### Cover Traffic
 - Sends periodic legitimate DNS queries to real domains through the same transport
 - Dilutes the tunnel-to-total DNS ratio that DPI uses to identify tunnel-only resolver usage
@@ -36,6 +26,16 @@ Stealth mode (random 15-40 char labels):
 Same data, same base32 encoding, fully backward compatible server decoding (server just concatenates all labels). ~3% throughput cost from label overhead.
 
 Also enables aggressive cover traffic (5-15s intervals vs 15-45s normal).
+
+### Per-Query UDP (`PerQueryUDPConn`)
+- Creates a **fresh UDP socket for every outgoing DNS query**, randomizing source ports to defeat fingerprinting by source-port correlation
+- Worker pool (64 goroutines) with per-query read timeout
+- Filters forged DNS responses (SERVFAIL/NXDOMAIN injections) by reading in a loop until a valid response arrives or timeout
+
+### Multi-Resolver Health Tracking
+- Monitors per-resolver response times with dead detection (12s timeout)
+- Automatic dead resolver probing (every 15s) and recovery
+- Queries fan out to all alive resolvers; KCP deduplicates, fastest wins
 
 ### Backward-Compatible Server
 The server auto-detects encoding per-query:

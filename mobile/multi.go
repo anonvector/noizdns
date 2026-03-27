@@ -175,8 +175,9 @@ const (
 	udpWorkers = 64
 	// udpReadTimeout is how long a worker waits for a valid response
 	// after sending a query. Must be long enough for a real response to
-	// arrive, but short enough that stale workers don't accumulate.
-	udpReadTimeout = 800 * time.Millisecond
+	// arrive after skipping forged injections, but short enough that
+	// stale workers don't accumulate.
+	udpReadTimeout = 1500 * time.Millisecond
 )
 
 // ForgedStats tracks censorship-injected DNS responses.
@@ -260,9 +261,9 @@ func (s *PerQueryUDPConn) worker() {
 	}
 }
 
-// handleQuery sends a DNS query on a fresh socket and reads the first response.
-// Stats are tracked for observability but all responses are passed through —
-// the dnstt library's dnsResponsePayload handles real validation.
+// handleQuery sends a DNS query on a fresh socket and reads responses,
+// skipping forged injections (SERVFAIL/NXDOMAIN) until a valid response
+// arrives or the deadline expires.
 func (s *PerQueryUDPConn) handleQuery(work udpWork) {
 	conn, err := net.DialUDP("udp", nil, work.addr)
 	if err != nil {
@@ -275,40 +276,46 @@ func (s *PerQueryUDPConn) handleQuery(work udpWork) {
 		return
 	}
 
-	conn.SetReadDeadline(time.Now().Add(udpReadTimeout))
+	deadline := time.Now().Add(udpReadTimeout)
+	conn.SetReadDeadline(deadline)
 	var buf [4096]byte
-	n, err := conn.Read(buf[:])
-	if err != nil {
-		return
-	}
 
-	// Track RCODE stats for observability.
-	if n >= 4 {
-		rcode := int(buf[3]) & 0x0f
-		switch rcode {
-		case dns.RcodeServerFailure:
-			atomic.AddInt64(&s.forgedSERVFAIL, 1)
-		case dns.RcodeNameError:
-			atomic.AddInt64(&s.forgedNXDOMAIN, 1)
-		case dns.RcodeNoError:
-			atomic.AddInt64(&s.validCount, 1)
-		default:
-			atomic.AddInt64(&s.forgedOther, 1)
+	for {
+		n, err := conn.Read(buf[:])
+		if err != nil {
+			return
 		}
-	}
 
-	s.tracker.markRecv(work.idx)
+		if n >= 4 {
+			rcode := int(buf[3]) & 0x0f
+			switch rcode {
+			case dns.RcodeServerFailure:
+				atomic.AddInt64(&s.forgedSERVFAIL, 1)
+				continue // skip forged injection, wait for real response
+			case dns.RcodeNameError:
+				atomic.AddInt64(&s.forgedNXDOMAIN, 1)
+				continue // skip forged injection, wait for real response
+			case dns.RcodeNoError:
+				atomic.AddInt64(&s.validCount, 1)
+			default:
+				atomic.AddInt64(&s.forgedOther, 1)
+			}
+		}
 
-	resp := udpResponse{
-		data: make([]byte, n),
-		n:    n,
-		addr: work.addr,
-	}
-	copy(resp.data, buf[:n])
+		s.tracker.markRecv(work.idx)
 
-	select {
-	case s.recvCh <- resp:
-	case <-s.closeCh:
+		resp := udpResponse{
+			data: make([]byte, n),
+			n:    n,
+			addr: work.addr,
+		}
+		copy(resp.data, buf[:n])
+
+		select {
+		case s.recvCh <- resp:
+		case <-s.closeCh:
+		}
+		return
 	}
 }
 
@@ -427,37 +434,43 @@ func (s *SinglePerQueryUDPConn) handleQuery(payload []byte) {
 		return
 	}
 
-	conn.SetReadDeadline(time.Now().Add(udpReadTimeout))
+	deadline := time.Now().Add(udpReadTimeout)
+	conn.SetReadDeadline(deadline)
 	var buf [4096]byte
-	n, err := conn.Read(buf[:])
-	if err != nil {
-		return
-	}
 
-	// Track RCODE stats for observability.
-	if n >= 4 {
-		rcode := int(buf[3]) & 0x0f
-		switch rcode {
-		case dns.RcodeServerFailure:
-			atomic.AddInt64(&s.forgedSERVFAIL, 1)
-		case dns.RcodeNameError:
-			atomic.AddInt64(&s.forgedNXDOMAIN, 1)
-		case dns.RcodeNoError:
-			atomic.AddInt64(&s.validCount, 1)
-		default:
-			atomic.AddInt64(&s.forgedOther, 1)
+	for {
+		n, err := conn.Read(buf[:])
+		if err != nil {
+			return
 		}
-	}
 
-	resp := udpResponse{
-		data: make([]byte, n),
-		n:    n,
-		addr: s.addr,
-	}
-	copy(resp.data, buf[:n])
-	select {
-	case s.recvCh <- resp:
-	case <-s.closeCh:
+		if n >= 4 {
+			rcode := int(buf[3]) & 0x0f
+			switch rcode {
+			case dns.RcodeServerFailure:
+				atomic.AddInt64(&s.forgedSERVFAIL, 1)
+				continue // skip forged injection
+			case dns.RcodeNameError:
+				atomic.AddInt64(&s.forgedNXDOMAIN, 1)
+				continue // skip forged injection
+			case dns.RcodeNoError:
+				atomic.AddInt64(&s.validCount, 1)
+			default:
+				atomic.AddInt64(&s.forgedOther, 1)
+			}
+		}
+
+		resp := udpResponse{
+			data: make([]byte, n),
+			n:    n,
+			addr: s.addr,
+		}
+		copy(resp.data, buf[:n])
+		select {
+		case s.recvCh <- resp:
+		case <-s.closeCh:
+		}
+		return
 	}
 }
 

@@ -5,24 +5,17 @@ package main
 import (
 	"flag"
 	"fmt"
-	"io"
-	"io/ioutil"
 	"log"
 	"net"
 	"os"
 	"os/signal"
 	"syscall"
 
-	pt "gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/goptlib"
 	"www.bamsoftware.com/git/dnstt.git/dns"
 	serverlib "www.bamsoftware.com/git/dnstt.git/dnstt-server/lib"
 	"www.bamsoftware.com/git/dnstt.git/noise"
 
 	noizdns "noizdns/server"
-)
-
-const (
-	ptMethodName = "dnstt"
 )
 
 var (
@@ -108,19 +101,25 @@ func readKeyFromFile(filename string) ([]byte, error) {
 
 func main() {
 	var genKey bool
+	var udpAddr string
 	var privkeyFilename string
 	var privkeyString string
 	var pubkeyFilename string
 
 	flag.Usage = func() {
 		_, _ = fmt.Fprintf(flag.CommandLine.Output(), `Usage:
-  %[1]s -gen-key -privkey-file PRIVKEYFILE -pubkey-file PUBKEYFILE
-  TOR_PT_MANAGED_TRANSPORT_VER=1 TOR_PT_SERVER_TRANSPORTS=dnstt TOR_PT_SERVER_BINDADDR=dnstt-ADDR TOR_PT_ORPORT=UPSTREAMADDR %[1]s -privkey-file server.key t.example.com
+  %[1]s -gen-key [-privkey-file PRIVKEYFILE] [-pubkey-file PUBKEYFILE]
+  %[1]s [-privkey PRIVKEY|-privkey-file PRIVKEYFILE] [-mtu MTU] DOMAIN LISTENADDR UPSTREAMADDR
+
+Example:
+  %[1]s -gen-key -privkey-file server.key -pubkey-file server.pub
+  %[1]s -privkey-file server.key -mtu 1232 t.example.com 0.0.0.0:53 127.0.0.1:8000
 
 `, os.Args[0])
 		flag.PrintDefaults()
 	}
 	flag.BoolVar(&genKey, "gen-key", false, "generate a server keypair; print to stdout or save to files")
+	flag.StringVar(&udpAddr, "udp", "", "UDP address to listen on (legacy, use positional LISTENADDR instead)")
 	flag.IntVar(&maxUDPPayload, "mtu", maxUDPPayload, "maximum size of DNS responses")
 	flag.StringVar(&privkeyString, "privkey", "", fmt.Sprintf("server private key (%d hex digits)", noise.KeyLen*2))
 	flag.StringVar(&privkeyFilename, "privkey-file", "", "read server private key from file (with -gen-key, write to file)")
@@ -139,22 +138,42 @@ func main() {
 			os.Exit(1)
 		}
 	} else {
-		if flag.NArg() != 1 {
+		var listenAddr, upstream string
+
+		switch {
+		case udpAddr != "" && flag.NArg() == 2:
+			// Legacy -udp flag mode (backward compat with slipgate v1.2)
+			listenAddr = udpAddr
+			upstream = flag.Arg(1)
+		case flag.NArg() == 3:
+			// Direct mode: DOMAIN LISTENADDR UPSTREAMADDR
+			listenAddr = flag.Arg(1)
+			upstream = flag.Arg(2)
+		case flag.NArg() == 1:
+			// Legacy PT env var mode (backward compat with slipgate v1.3.1)
+			bindAddr := os.Getenv("TOR_PT_SERVER_BINDADDR")
+			upstream = os.Getenv("TOR_PT_ORPORT")
+			if bindAddr == "" || upstream == "" {
+				flag.Usage()
+				os.Exit(1)
+			}
+			// Strip "dnstt-" prefix from bind address
+			if len(bindAddr) > 6 && bindAddr[:6] == "dnstt-" {
+				bindAddr = bindAddr[6:]
+			}
+			listenAddr = bindAddr
+			log.Println("using legacy PT environment variables; consider upgrading slipgate")
+		default:
 			flag.Usage()
 			os.Exit(1)
 		}
+
 		domain, err := dns.ParseName(flag.Arg(0))
 		if err != nil {
 			log.Printf("invalid domain %+q: %v\n", flag.Arg(0), err)
 			os.Exit(1)
 		}
 
-		ptInfo, err := pt.ServerSetup(nil)
-		if err != nil {
-			log.Fatalf("error in setup: %s", err)
-		}
-
-		upstream := ptInfo.OrAddr.String()
 		{
 			upstreamHost, _, err := net.SplitHostPort(upstream)
 			if err != nil {
@@ -205,69 +224,31 @@ func main() {
 			}
 		}
 
-		connections := make([]net.PacketConn, 0)
-		for _, bindaddr := range ptInfo.Bindaddrs {
-			if bindaddr.MethodName != ptMethodName {
-				_ = pt.SmethodError(bindaddr.MethodName, "no such method")
-				continue
-			}
-
-			if bindaddr.Addr.Port == 0 {
-				err := fmt.Errorf(
-					"cannot listen on port %d; configure a port with TOR_PT_SERVER_BINDADDR",
-					bindaddr.Addr.Port)
-				log.Printf("error opening listener: %s", err)
-				_ = pt.SmethodError(bindaddr.MethodName, err.Error())
-				continue
-			}
-
-			udpAddr := bindaddr.Addr.String()
-			dnsConn, err := net.ListenPacket("udp", udpAddr)
-			if err != nil {
-				log.Printf("opening UDP listener: %v\n", err)
-				_ = pt.SmethodError(bindaddr.MethodName, err.Error())
-				continue
-			}
-
-			defer func() {
-				_ = dnsConn.Close()
-			}()
-
-			// Backward-compatible hooks: accepts base32 (fast path for new
-			// clients) and auto-detects hex/base36 (legacy clients).
-			hooks := noizdns.NewHooks()
-
-			go func() {
-				err := serverlib.Run(privkey, domain, upstream, dnsConn, maxUDPPayload, hooks)
-				if err != nil {
-					log.Print(err)
-				}
-			}()
-
-			pt.SmethodArgs(bindaddr.MethodName, bindaddr.Addr, pt.Args{})
-			connections = append(connections, dnsConn)
+		dnsConn, err := net.ListenPacket("udp", listenAddr)
+		if err != nil {
+			log.Fatalf("opening UDP listener: %v\n", err)
 		}
+		defer func() {
+			_ = dnsConn.Close()
+		}()
 
-		pt.SmethodsDone()
+		log.Printf("listening on %s", listenAddr)
+
+		// Backward-compatible hooks: accepts base32 (fast path for new
+		// clients) and auto-detects hex/base36 (legacy clients).
+		hooks := noizdns.NewHooks()
+
+		go func() {
+			err := serverlib.Run(privkey, domain, upstream, dnsConn, maxUDPPayload, hooks)
+			if err != nil {
+				log.Fatal(err)
+			}
+		}()
 
 		sigChan := make(chan os.Signal, 1)
-		signal.Notify(sigChan, syscall.SIGTERM)
-
-		if os.Getenv("TOR_PT_EXIT_ON_STDIN_CLOSE") == "1" {
-			go func() {
-				if _, err := io.Copy(ioutil.Discard, os.Stdin); err != nil {
-					log.Printf("error copying os.Stdin to ioutil.Discard: %v", err)
-				}
-				log.Printf("synthesizing SIGTERM because of stdin close")
-				sigChan <- syscall.SIGTERM
-			}()
-		}
+		signal.Notify(sigChan, syscall.SIGTERM, syscall.SIGINT)
 
 		sig := <-sigChan
-
 		log.Printf("caught signal %q, exiting", sig)
-		for _, conn := range connections {
-			_ = conn.Close()
-		}
 	}
 }
