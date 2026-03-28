@@ -7,7 +7,7 @@
 //   - "tls://host:port" → DoT (DNS over TLS) with uTLS fingerprinting
 //   - "tcp://host:port" → plain TCP DNS (2-byte length framing, no TLS)
 //   - "host:port" → plain UDP DNS
-package noizdns
+package mobile
 
 import (
 	"context"
@@ -1037,6 +1037,11 @@ func handleWithAuth(local *net.TCPConn, sess *smux.Session, conv uint32, copyBuf
 			log.Printf("stream %08x:%d copy local←stream: %v", conv, stream.ID(), err)
 		}
 		local.CloseWrite()
+		if err != nil {
+			// Stream was forcefully closed (e.g. tunnel disconnect).
+			// Close local read to unblock the local→stream goroutine.
+			local.CloseRead()
+		}
 	}()
 	wg.Wait()
 	return nil

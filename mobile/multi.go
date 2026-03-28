@@ -1,4 +1,4 @@
-package noizdns
+package mobile
 
 import (
 	"log"
