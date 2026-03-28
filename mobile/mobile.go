@@ -66,8 +66,13 @@ type DnsttClient struct {
 	// 0 = 1232 (default, RFC 8020). Configurable via SetEDNS0Size.
 	edns0Size int
 
+	// noizMode enables NoizDNS features (cover traffic, custom sender,
+	// shorter QNAME, tuned polling). When false, uses original dnstt
+	// defaults for maximum compatibility and stability.
+	noizMode bool
+
 	// stealthMode enables variable-length label splitting and aggressive
-	// cover traffic. Trades throughput for DPI resistance.
+	// cover traffic. Trades throughput for DPI resistance. Requires noizMode.
 	stealthMode bool
 
 	// deviceManufacturer is used to filter cover traffic domains that
@@ -142,9 +147,14 @@ func (c *DnsttClient) SetAuthoritativeMode(enabled bool) {
 	c.authoritativeMode = enabled
 }
 
-// SetNoizMode is a no-op kept for Android API compatibility.
-// Deprecated: noizdns encoding was removed; all clients use standard base32.
-func (c *DnsttClient) SetNoizMode(enabled bool) {}
+// SetNoizMode enables NoizDNS features: cover traffic, custom sender hooks,
+// shorter QNAME (150 bytes), and tuned polling for ISP resolver blending.
+// When disabled (default), uses original dnstt defaults (full 255 QNAME,
+// simple polling, no cover traffic) for maximum stability.
+// Must be called before Start.
+func (c *DnsttClient) SetNoizMode(enabled bool) {
+	c.noizMode = enabled
+}
 
 // SetStealthMode enables variable-length DNS label splitting and aggressive
 // cover traffic. Queries use randomized label sizes (15-40 chars) instead of
@@ -532,7 +542,8 @@ func (c *DnsttClient) Start() error {
 			MaxPollDelay:  4 * time.Second,
 			EDNS0Size:     c.edns0Size,
 		}
-	} else {
+	} else if c.noizMode {
+		// NoizDNS: tuned polling that blends with normal DNS on ISP resolvers
 		edns0 := c.edns0Size
 		if edns0 == 0 {
 			edns0 = 1232 // RFC 8020 — blends with normal DNS clients
@@ -545,11 +556,14 @@ func (c *DnsttClient) Start() error {
 			BurstMode:     true,
 			EDNS0Size:     edns0,
 		}
+	} else {
+		// Plain DNSTT: original upstream defaults for maximum stability
+		dnsConfig = &dnsttclient.DNSPacketConnConfig{PollLimit: 8}
 	}
 
-	// Cover traffic and optional stealth encoding. Only for non-authoritative
-	// mode (public resolvers where DPI is a concern).
-	if !c.authoritativeMode {
+	// Cover traffic and optional stealth encoding. Only for NoizDNS on
+	// non-authoritative mode (public resolvers where DPI is a concern).
+	if c.noizMode && !c.authoritativeMode {
 		coverDomains := noizdns.FilterCoverDomains(noizdns.DefaultCoverDomains, c.deviceManufacturer)
 		// Cover traffic intervals: stealth uses aggressive 5-15s, normal uses 15-45s.
 		coverMin, coverMax := 15*time.Second, 45*time.Second
@@ -1066,12 +1080,12 @@ func (c *DnsttClient) run(ctx context.Context, pubkey []byte, domain dns.Name, l
 		ln.Close()
 	}()
 
-	// Non-authoritative mode uses a shorter QNAME (150 bytes vs 255) so
-	// queries look more like normal DNS traffic on restrictive networks.
-	// Stealth mode uses variable-length labels which have slightly more
-	// overhead (15-40 char labels vs fixed 63), accounted for here.
+	// QNAME sizing:
+	// - Authoritative / plain DNSTT: full 255-byte QNAME for maximum throughput
+	// - NoizDNS: shorter 150-byte QNAME to blend with normal DNS traffic
+	// - Stealth: variable-length labels with slightly more overhead
 	var nameCapacity int
-	if c.authoritativeMode {
+	if c.authoritativeMode || !c.noizMode {
 		nameCapacity = dnsNameCapacity(domain)
 	} else if c.stealthMode {
 		nameCapacity = noizdns.StealthNameCapacity(domain, 150)
@@ -1092,8 +1106,8 @@ func (c *DnsttClient) run(ctx context.Context, pubkey []byte, domain dns.Name, l
 		return fmt.Errorf("domain %s leaves only %d bytes for payload (MTU %d); try using a shorter tunnel domain", domain, mtu)
 	}
 	maxPayload := c.maxPayload
-	if maxPayload == 0 {
-		maxPayload = 100
+	if maxPayload == 0 && c.noizMode {
+		maxPayload = 100 // NoizDNS: smaller queries to blend with normal DNS
 	}
 	if maxPayload >= 50 && maxPayload < mtu {
 		log.Printf("capping MTU from %d to %d (maxPayload)", mtu, maxPayload)
