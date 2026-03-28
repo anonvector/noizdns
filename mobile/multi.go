@@ -1,4 +1,4 @@
-package mobile
+package noizdns
 
 import (
 	"log"
@@ -164,6 +164,78 @@ func (t *resolverTracker) checkHealth() {
 func (t *resolverTracker) close() {
 	t.stopOnce.Do(func() { close(t.stopCh) })
 }
+
+// ---------------------------------------------------------------------------
+// SmartUDPConn — persistent socket, fan-out to all alive resolvers
+// ---------------------------------------------------------------------------
+
+// SmartUDPConn wraps a single UDP socket and fans out each query to ALL alive
+// resolvers simultaneously. KCP deduplicates responses, so the fastest reply
+// wins. Dead resolvers are periodically probed for recovery.
+type SmartUDPConn struct {
+	conn    *net.UDPConn
+	addrs   []*net.UDPAddr
+	addrMap map[string]int // IP:port → index for markRecv
+	tracker *resolverTracker
+}
+
+// NewSmartUDPConn creates a smart UDP conn that distributes queries across resolvers.
+func NewSmartUDPConn(addrs []*net.UDPAddr) (*SmartUDPConn, error) {
+	conn, err := net.ListenUDP("udp", nil)
+	if err != nil {
+		return nil, err
+	}
+	addrMap := make(map[string]int, len(addrs))
+	for i, a := range addrs {
+		addrMap[a.String()] = i
+	}
+	return &SmartUDPConn{
+		conn:    conn,
+		addrs:   addrs,
+		addrMap: addrMap,
+		tracker: newResolverTracker(len(addrs)),
+	}, nil
+}
+
+func (s *SmartUDPConn) WriteTo(p []byte, _ net.Addr) (int, error) {
+	targets := s.tracker.pickAlive()
+	var lastN int
+	var lastErr error
+	for _, idx := range targets {
+		s.tracker.markSent(idx)
+		n, err := s.conn.WriteTo(p, s.addrs[idx])
+		if err != nil {
+			lastErr = err
+		} else {
+			lastN = n
+			lastErr = nil
+		}
+	}
+	if lastErr == nil {
+		return lastN, nil
+	}
+	return 0, lastErr
+}
+
+func (s *SmartUDPConn) ReadFrom(p []byte) (int, net.Addr, error) {
+	n, addr, err := s.conn.ReadFrom(p)
+	if err == nil {
+		if idx, ok := s.addrMap[addr.String()]; ok {
+			s.tracker.markRecv(idx)
+		}
+	}
+	return n, addr, err
+}
+
+func (s *SmartUDPConn) Close() error {
+	s.tracker.close()
+	return s.conn.Close()
+}
+
+func (s *SmartUDPConn) LocalAddr() net.Addr                { return s.conn.LocalAddr() }
+func (s *SmartUDPConn) SetDeadline(t time.Time) error      { return s.conn.SetDeadline(t) }
+func (s *SmartUDPConn) SetReadDeadline(t time.Time) error  { return s.conn.SetReadDeadline(t) }
+func (s *SmartUDPConn) SetWriteDeadline(t time.Time) error { return s.conn.SetWriteDeadline(t) }
 
 // ---------------------------------------------------------------------------
 // PerQueryUDPConn — per-query fresh sockets with forged response filtering

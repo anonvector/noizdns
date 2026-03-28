@@ -7,7 +7,7 @@
 //   - "tls://host:port" → DoT (DNS over TLS) with uTLS fingerprinting
 //   - "tcp://host:port" → plain TCP DNS (2-byte length framing, no TLS)
 //   - "host:port" → plain UDP DNS
-package mobile
+package noizdns
 
 import (
 	"context"
@@ -481,17 +481,19 @@ func (c *DnsttClient) Start() error {
 		} else {
 			addrs := strings.Split(c.dnsAddr, ",")
 			if len(addrs) == 1 {
-				// Single resolver — per-query sockets for source port randomization.
-				udpAddr, rErr := net.ResolveUDPAddr("udp", strings.TrimSpace(addrs[0]))
-				if rErr != nil {
+				// Single resolver — persistent socket.
+				remoteAddr, err = net.ResolveUDPAddr("udp", strings.TrimSpace(addrs[0]))
+				if err != nil {
 					cancel()
-					return fmt.Errorf("resolving UDP address: %v", rErr)
+					return fmt.Errorf("resolving UDP address: %v", err)
 				}
-				pconn = NewSinglePerQueryUDPConn(udpAddr)
-				remoteAddr = turbotunnel.DummyAddr{}
-				log.Printf("single-resolver UDP: per-query sockets")
+				pconn, err = net.ListenUDP("udp", nil)
+				if err != nil {
+					cancel()
+					return fmt.Errorf("opening UDP socket: %v", err)
+				}
 			} else {
-				// Multiple resolvers — per-query sockets, fan out to all alive.
+				// Multiple resolvers — smart routing, first response wins.
 				var udpAddrs []*net.UDPAddr
 				for _, a := range addrs {
 					addr, rErr := net.ResolveUDPAddr("udp", strings.TrimSpace(a))
@@ -501,9 +503,14 @@ func (c *DnsttClient) Start() error {
 					}
 					udpAddrs = append(udpAddrs, addr)
 				}
-				pconn = NewPerQueryUDPConn(udpAddrs)
+				sconn, sErr := NewSmartUDPConn(udpAddrs)
+				if sErr != nil {
+					cancel()
+					return fmt.Errorf("opening UDP socket: %v", sErr)
+				}
+				pconn = sconn
 				remoteAddr = turbotunnel.DummyAddr{}
-				log.Printf("multi-resolver UDP: %d resolvers (per-query sockets)", len(udpAddrs))
+				log.Printf("multi-resolver UDP: %d resolvers (smart)", len(udpAddrs))
 			}
 		}
 	}
@@ -531,11 +538,12 @@ func (c *DnsttClient) Start() error {
 			edns0 = 1232 // RFC 8020 — blends with normal DNS clients
 		}
 		dnsConfig = &dnsttclient.DNSPacketConnConfig{
-			PollLimit:    8,
-			MaxPollDelay: 30 * time.Second,
-			PollJitter:   true,
-			BurstMode:    true,
-			EDNS0Size:    edns0,
+			PollLimit:     10,
+			InitPollDelay: 200 * time.Millisecond,
+			MaxPollDelay:  5 * time.Second,
+			PollJitter:    true,
+			BurstMode:     true,
+			EDNS0Size:     edns0,
 		}
 	}
 

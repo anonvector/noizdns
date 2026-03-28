@@ -37,15 +37,10 @@ Same data, same base32 encoding, fully backward compatible server decoding (serv
 
 Also enables aggressive cover traffic (5-15s intervals vs 15-45s normal).
 
-### Per-Query UDP (`PerQueryUDPConn`)
-- Creates a **fresh UDP socket for every outgoing DNS query**, randomizing source ports to defeat fingerprinting by source-port correlation
-- Worker pool (64 goroutines) with per-query read timeout
-- Filters forged DNS responses (SERVFAIL/NXDOMAIN injections) by reading in a loop until a valid response arrives or timeout
-
-### Multi-Resolver Health Tracking
+### Multi-Resolver Health Tracking (`SmartUDPConn`)
+- Persistent UDP socket with fan-out to all alive resolvers; KCP deduplicates, fastest wins
 - Monitors per-resolver response times with dead detection (12s timeout)
 - Automatic dead resolver probing (every 15s) and recovery
-- Queries fan out to all alive resolvers; KCP deduplicates, fastest wins
 
 ### Backward-Compatible Server
 The server auto-detects encoding per-query:
@@ -71,8 +66,8 @@ noizdns/
 ├── server/
 │   └── decode.go         # Server-side decoding (base32 fast path + legacy fallback)
 ├── mobile/
-│   ├── mobile.go         # gomobile-compatible client API (Android/iOS)
-│   └── multi.go          # PerQueryUDPConn, multi-resolver health tracking
+│   ├── mobile.go         # gomobile-compatible client API (package noizdns)
+│   └── multi.go          # SmartUDPConn, multi-resolver health tracking
 └── cmd/
     ├── noizdns-server/
     │   └── main.go       # Pluggable transport server binary
@@ -82,10 +77,14 @@ noizdns/
 
 ## Client API (mobile)
 
-```go
-import "noizdns/mobile"
+The mobile package is `noizdns` (not `mobile`) so it can coexist with
+`dnstt-mobile/mobile` in the same gomobile build. In Java/Kotlin the
+factory class is `noizdns.Noizdns`.
 
-client, err := mobile.NewClient(
+```go
+import "noizdns/mobile" // package noizdns
+
+client, err := noizdns.NewClient(
     "8.8.8.8:53",           // DNS resolver(s), comma-separated for multi
     "t.example.com",        // Tunnel domain
     "aabbccdd...",          // Server public key (hex)
@@ -109,8 +108,8 @@ defer client.Stop()
 |---|---|---|---|
 | QNAME limit | 255 bytes | 150 bytes | 150 bytes |
 | Label splitting | Fixed 63 | Fixed 63 | Random 15-40 |
-| PollLimit | 12 | 8 | 8 |
-| MaxPollDelay | 4s | 30s | 30s |
+| PollLimit | 12 | 10 | 10 |
+| MaxPollDelay | 4s | 5s | 5s |
 | Poll jitter | no | yes (±30%) | yes (±30%) |
 | Burst polling | no | yes | yes |
 | Cover traffic | off | 15-45s | 5-15s |
