@@ -35,20 +35,6 @@ import (
 	"www.bamsoftware.com/git/dnstt.git/turbotunnel"
 )
 
-// expectedCertHash is set at link time via -ldflags
-// -X 'noizdns/mobile.expectedCertHash=<sha256hex>'.
-// Empty or unset = dev build (no enforcement).
-var expectedCertHash string
-
-// sessionToken stores the caller's cert hash, set via BindSession.
-var sessionToken string
-
-// BindSession passes the caller's signing certificate SHA-256 hex digest.
-// Must be called before Start. No-op when expectedCertHash is empty (dev build).
-func BindSession(token string) {
-	sessionToken = token
-}
-
 // smux streams will be closed after this much time without receiving data.
 const idleTimeout = 2 * time.Minute
 
@@ -251,11 +237,6 @@ func (c *DnsttClient) Start() error {
 
 	if c.running {
 		return fmt.Errorf("client is already running")
-	}
-
-	// Runtime binding check — no-op for dev builds.
-	if expectedCertHash != "" && sessionToken != expectedCertHash {
-		return fmt.Errorf("failed to initialize transport")
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
