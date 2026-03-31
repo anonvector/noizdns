@@ -41,10 +41,9 @@ const idleTimeout = 2 * time.Minute
 // Default uTLS fingerprint distribution (matches upstream default).
 const defaultUTLSDistribution = "4*random,3*Firefox_120,1*Firefox_105,3*Chrome_120,1*Chrome_102,1*iOS_14,1*iOS_13"
 
-// numPadding is the per-query padding overhead used in the MTU calculation.
-// Data queries don't need random padding because the payload itself varies;
-// poll queries still get their own nonce inside the upstream codec.
-const numPadding = 0
+// numPadding is the number of random padding bytes per query for cache busting.
+// Must match the value in client/stealth.go's encodePayload().
+const numPadding = 1
 
 // DnsttClient wraps a DNSTT tunnel client with Start/Stop lifecycle.
 type DnsttClient struct {
@@ -542,11 +541,12 @@ func (c *DnsttClient) Start() error {
 			MaxPollDelay:  4 * time.Second,
 			EDNS0Size:     c.edns0Size,
 		}
-	} else if c.noizMode {
-		// NoizDNS: tuned polling that blends with normal DNS on ISP resolvers
+	} else if c.noizMode && c.stealthMode {
+		// Stealth NoizDNS: slower polling with jitter and burst patterns
+		// to evade DPI fingerprinting. Trades latency for stealth.
 		edns0 := c.edns0Size
 		if edns0 == 0 {
-			edns0 = 1232 // RFC 8020 — blends with normal DNS clients
+			edns0 = 1232
 		}
 		dnsConfig = &dnsttclient.DNSPacketConnConfig{
 			PollLimit:     10,
@@ -554,6 +554,18 @@ func (c *DnsttClient) Start() error {
 			MaxPollDelay:  5 * time.Second,
 			PollJitter:    true,
 			BurstMode:     true,
+			EDNS0Size:     edns0,
+		}
+	} else if c.noizMode {
+		// NoizDNS: responsive polling for fast SSH handshakes and data transfer
+		edns0 := c.edns0Size
+		if edns0 == 0 {
+			edns0 = 1232
+		}
+		dnsConfig = &dnsttclient.DNSPacketConnConfig{
+			PollLimit:     12,
+			InitPollDelay: 150 * time.Millisecond,
+			MaxPollDelay:  4 * time.Second,
 			EDNS0Size:     edns0,
 		}
 	} else {
@@ -1081,16 +1093,14 @@ func (c *DnsttClient) run(ctx context.Context, pubkey []byte, domain dns.Name, l
 	}()
 
 	// QNAME sizing:
-	// - Authoritative / plain DNSTT: full 255-byte QNAME for maximum throughput
-	// - NoizDNS: shorter 150-byte QNAME to blend with normal DNS traffic
-	// - Stealth: variable-length labels with slightly more overhead
+	// - Authoritative: always full 255-byte QNAME (own resolver, no DPI concern)
+	// - Stealth (non-authoritative): shorter 150-byte QNAME to blend with normal DNS
+	// - Everything else: full 255 for throughput
 	var nameCapacity int
-	if c.authoritativeMode || !c.noizMode {
-		nameCapacity = dnsNameCapacity(domain)
-	} else if c.stealthMode {
+	if c.stealthMode && !c.authoritativeMode {
 		nameCapacity = noizdns.StealthNameCapacity(domain, 150)
 	} else {
-		nameCapacity = dnsNameCapacityWithLimit(domain, 150)
+		nameCapacity = dnsNameCapacity(domain)
 	}
 	mtu := nameCapacity - 8 - 1 - numPadding - 1
 	if mtu < 80 {
@@ -1106,8 +1116,8 @@ func (c *DnsttClient) run(ctx context.Context, pubkey []byte, domain dns.Name, l
 		return fmt.Errorf("domain %s leaves only %d bytes for payload (MTU %d); try using a shorter tunnel domain", domain, mtu)
 	}
 	maxPayload := c.maxPayload
-	if maxPayload == 0 && c.noizMode {
-		maxPayload = 100 // NoizDNS: smaller queries to blend with normal DNS
+	if maxPayload == 0 && c.noizMode && c.stealthMode && !c.authoritativeMode {
+		maxPayload = 100 // Stealth NoizDNS: smaller queries to blend with normal DNS
 	}
 	if maxPayload >= 50 && maxPayload < mtu {
 		log.Printf("capping MTU from %d to %d (maxPayload)", mtu, maxPayload)
@@ -1139,6 +1149,11 @@ func (c *DnsttClient) run(ctx context.Context, pubkey []byte, domain dns.Name, l
 		conn.SetNoDelay(1, 20, 2, 1)
 		conn.SetACKNoDelay(true)
 		conn.SetWindowSize(256, 256)
+	} else if c.noizMode {
+		// NoizDNS: fast flush + fast retransmit for responsive SSH handshakes
+		conn.SetNoDelay(1, 30, 2, 1)
+		conn.SetACKNoDelay(true)
+		conn.SetWindowSize(192, 192)
 	} else {
 		conn.SetNoDelay(0, 0, 0, 1)
 		conn.SetWindowSize(64, 64)
@@ -1160,10 +1175,12 @@ func (c *DnsttClient) run(ctx context.Context, pubkey []byte, domain dns.Name, l
 		// Aggressive: larger buffers for better throughput
 		smuxConfig.MaxStreamBuffer = 4 * 1024 * 1024   // 4MB (default 64KB)
 		smuxConfig.MaxReceiveBuffer = 16 * 1024 * 1024 // 16MB (default 4MB)
+	} else if c.noizMode {
+		// NoizDNS: larger buffers to reduce stalls on page loads
+		smuxConfig.MaxStreamBuffer = 1 * 1024 * 1024   // 1MB (default 64KB)
+		smuxConfig.MaxReceiveBuffer = 16 * 1024 * 1024 // 16MB (default 4MB)
 	} else {
-		// Reduce smux keepalive frequency to save battery/data.
-		// Default is 10s which generates a DNS query every 10s even when idle.
-		// 30s is enough to keep the session alive without excessive radio wakes.
+		// Plain DNSTT: reduce smux keepalive frequency to save battery/data.
 		smuxConfig.KeepAliveInterval = 30 * time.Second
 	}
 	sess, err := smux.Client(rw, smuxConfig)
