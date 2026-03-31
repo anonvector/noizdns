@@ -12,7 +12,6 @@ import (
 	"encoding/base32"
 	"encoding/binary"
 	"fmt"
-	"io"
 	"net"
 
 	"www.bamsoftware.com/git/dnstt.git/dns"
@@ -29,47 +28,8 @@ const (
 	stealthLabelMax = 40
 )
 
-// cdnPrefixes are multi-level fake labels prepended to ~25% of queries to make
-// the domain look like a real CDN or cloud endpoint. Every label contains a
-// hyphen so the server can distinguish them from base32 data labels.
-var cdnPrefixes = [][]string{
-	{"img-cache", "us-east-1"},
-	{"cdn-static", "prod-v1"},
-	{"api-gw", "eu-west-2"},
-	{"assets-cdn", "v3-rel"},
-	{"static-cdn", "origin-gw"},
-	{"media-cdn", "global-r1"},
-	{"js-pkg", "release-v2"},
-	{"wss-proxy", "region-1"},
-	{"content-cdn", "dist-v1"},
-	{"app-static", "v2-rel"},
-	{"logs-v1", "ingest-gw"},
-	{"tele-metric", "collect-v1"},
-	{"img-opt", "cdn-r2"},
-	{"style-min", "css-v1"},
-	{"font-woff", "cdn-r3"},
-}
-
-// maybeCDNPrefix prepends a random CDN prefix to labels with the given probability.
-// rate=4 means ~25% (1 in 4), rate=1 means 100%.
-func maybeCDNPrefix(labels dns.Name, rate int) dns.Name {
-	var b [1]byte
-	_, _ = rand.Read(b[:])
-	if rate > 1 && int(b[0])%rate != 0 {
-		return labels
-	}
-	idx := int(b[0]) % len(cdnPrefixes)
-	prefix := cdnPrefixes[idx]
-	prefixLabels := make(dns.Name, len(prefix))
-	for i, p := range prefix {
-		prefixLabels[i] = []byte(p)
-	}
-	return append(prefixLabels, labels...)
-}
-
 // NormalSender replaces the default dnstt send() with zero-padding encoding.
-// Uses fixed 63-byte labels (same as dnstt) but skips random padding to
-// maximize payload capacity. ~25% of queries get CDN prefix camouflage.
+// Uses fixed 63-byte labels (same as dnstt) to maximize payload capacity.
 type NormalSender struct {
 	ClientID  turbotunnel.ClientID
 	Domain    dns.Name
@@ -96,32 +56,24 @@ type StealthSender struct {
 }
 
 // Send encodes p into a DNS query with variable-length labels and sends it.
-// All stealth queries get CDN prefix camouflage.
 func (s *StealthSender) Send(transport net.PacketConn, p []byte, addr net.Addr) error {
 	encoded, err := encodePayload(s.ClientID, p)
 	if err != nil {
 		return err
 	}
 	labels := varChunks(encoded, stealthLabelMin, stealthLabelMax)
-	labels = maybeCDNPrefix(labels, 1) // 100% of queries
 	labels = append(labels, s.Domain...)
 	return sendQuery(labels, s.EDNS0Size, transport, addr)
 }
 
-// numPadding is the number of random bytes added to each query for cache busting.
-// Without this, poll queries (no payload) produce identical QNAMEs and get cached
-// by the resolver, stalling the tunnel.
-const numPadding = 1
-
-// encodePayload builds the base32-encoded QNAME payload with random padding.
+// encodePayload builds the base32-encoded QNAME payload with zero padding.
 func encodePayload(clientID turbotunnel.ClientID, p []byte) ([]byte, error) {
 	if len(p) >= 224 {
 		return nil, fmt.Errorf("payload too long: %d >= 224", len(p))
 	}
 	var buf bytes.Buffer
 	buf.Write(clientID[:])
-	buf.WriteByte(byte(224 + numPadding))
-	_, _ = io.CopyN(&buf, rand.Reader, numPadding)
+	buf.WriteByte(224) // zero padding
 	if len(p) > 0 {
 		buf.WriteByte(byte(len(p)))
 		buf.Write(p)

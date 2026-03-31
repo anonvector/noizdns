@@ -41,9 +41,9 @@ const idleTimeout = 2 * time.Minute
 // Default uTLS fingerprint distribution (matches upstream default).
 const defaultUTLSDistribution = "4*random,3*Firefox_120,1*Firefox_105,3*Chrome_120,1*Chrome_102,1*iOS_14,1*iOS_13"
 
-// numPadding is the number of random padding bytes per query for cache busting.
-// Must match the value in client/stealth.go's encodePayload().
-const numPadding = 1
+// numPadding matches the zero-padding constant in client/stealth.go's encodePayload().
+// Data queries already vary (different payloads); poll queries have their own padding.
+const numPadding = 0
 
 // DnsttClient wraps a DNSTT tunnel client with Start/Stop lifecycle.
 type DnsttClient struct {
@@ -1093,14 +1093,16 @@ func (c *DnsttClient) run(ctx context.Context, pubkey []byte, domain dns.Name, l
 	}()
 
 	// QNAME sizing:
-	// - Authoritative: always full 255-byte QNAME (own resolver, no DPI concern)
-	// - Stealth (non-authoritative): shorter 150-byte QNAME to blend with normal DNS
-	// - Everything else: full 255 for throughput
+	// - Authoritative: full 255-byte QNAME (own resolver, no DPI concern)
+	// - Non-authoritative (stealth or not): 150-byte QNAME to avoid DPI detection
+	//   (255-byte QNAMEs are a classic DNS tunnel fingerprint on ISP resolvers)
 	var nameCapacity int
-	if c.stealthMode && !c.authoritativeMode {
+	if c.authoritativeMode {
+		nameCapacity = dnsNameCapacity(domain)
+	} else if c.stealthMode {
 		nameCapacity = noizdns.StealthNameCapacity(domain, 150)
 	} else {
-		nameCapacity = dnsNameCapacity(domain)
+		nameCapacity = dnsNameCapacityWithLimit(domain, 150)
 	}
 	mtu := nameCapacity - 8 - 1 - numPadding - 1
 	if mtu < 80 {
@@ -1116,8 +1118,8 @@ func (c *DnsttClient) run(ctx context.Context, pubkey []byte, domain dns.Name, l
 		return fmt.Errorf("domain %s leaves only %d bytes for payload (MTU %d); try using a shorter tunnel domain", domain, mtu)
 	}
 	maxPayload := c.maxPayload
-	if maxPayload == 0 && c.noizMode && c.stealthMode && !c.authoritativeMode {
-		maxPayload = 100 // Stealth NoizDNS: smaller queries to blend with normal DNS
+	if maxPayload == 0 && c.noizMode && !c.authoritativeMode {
+		maxPayload = 100 // NoizDNS on ISP resolvers: cap query size to blend with normal DNS
 	}
 	if maxPayload >= 50 && maxPayload < mtu {
 		log.Printf("capping MTU from %d to %d (maxPayload)", mtu, maxPayload)
