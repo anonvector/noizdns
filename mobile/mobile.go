@@ -1117,13 +1117,9 @@ func (c *DnsttClient) run(ctx context.Context, pubkey []byte, domain dns.Name, l
 	if mtu < 80 {
 		return fmt.Errorf("domain %s leaves only %d bytes for payload (MTU %d); try using a shorter tunnel domain", domain, mtu)
 	}
-	maxPayload := c.maxPayload
-	if maxPayload == 0 && c.noizMode && !c.authoritativeMode {
-		maxPayload = 100 // NoizDNS on ISP resolvers: cap query size to blend with normal DNS
-	}
-	if maxPayload >= 50 && maxPayload < mtu {
-		log.Printf("capping MTU from %d to %d (maxPayload)", mtu, maxPayload)
-		mtu = maxPayload
+	if c.maxPayload >= 50 && c.maxPayload < mtu {
+		log.Printf("capping MTU from %d to %d (maxPayload)", mtu, c.maxPayload)
+		mtu = c.maxPayload
 	}
 	log.Printf("effective MTU %d", mtu)
 
