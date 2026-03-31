@@ -536,7 +536,7 @@ func (c *DnsttClient) Start() error {
 	if c.authoritativeMode {
 		// Aggressive: faster polling for lower latency
 		dnsConfig = &dnsttclient.DNSPacketConnConfig{
-			PollLimit:     12,
+			PollLimit:     16,
 			InitPollDelay: 200 * time.Millisecond,
 			MaxPollDelay:  4 * time.Second,
 			EDNS0Size:     c.edns0Size,
@@ -549,7 +549,7 @@ func (c *DnsttClient) Start() error {
 			edns0 = 1232
 		}
 		dnsConfig = &dnsttclient.DNSPacketConnConfig{
-			PollLimit:     10,
+			PollLimit:     16,
 			InitPollDelay: 200 * time.Millisecond,
 			MaxPollDelay:  5 * time.Second,
 			PollJitter:    true,
@@ -563,14 +563,14 @@ func (c *DnsttClient) Start() error {
 			edns0 = 1232
 		}
 		dnsConfig = &dnsttclient.DNSPacketConnConfig{
-			PollLimit:     12,
+			PollLimit:     16,
 			InitPollDelay: 150 * time.Millisecond,
 			MaxPollDelay:  4 * time.Second,
 			EDNS0Size:     edns0,
 		}
 	} else {
-		// Plain DNSTT: original upstream defaults for maximum stability
-		dnsConfig = &dnsttclient.DNSPacketConnConfig{PollLimit: 8}
+		// Plain DNSTT: upstream defaults
+		dnsConfig = &dnsttclient.DNSPacketConnConfig{PollLimit: 16}
 	}
 
 	// Cover traffic and optional stealth encoding. Only for NoizDNS on
