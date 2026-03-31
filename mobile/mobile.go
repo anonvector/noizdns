@@ -565,7 +565,7 @@ func (c *DnsttClient) Start() error {
 		dnsConfig = &dnsttclient.DNSPacketConnConfig{
 			PollLimit:     16,
 			InitPollDelay: 150 * time.Millisecond,
-			MaxPollDelay:  4 * time.Second,
+			MaxPollDelay:  5 * time.Second,
 			EDNS0Size:     edns0,
 		}
 	} else {
