@@ -534,15 +534,15 @@ func (c *DnsttClient) Start() error {
 	// Wrap the transport with DNSPacketConn for DNS encoding.
 	var dnsConfig *dnsttclient.DNSPacketConnConfig
 	if c.authoritativeMode {
-		// Aggressive: faster polling for lower latency
+		// Aggressive: own resolver, fastest possible polling
 		dnsConfig = &dnsttclient.DNSPacketConnConfig{
 			PollLimit:     16,
-			InitPollDelay: 200 * time.Millisecond,
+			InitPollDelay: 150 * time.Millisecond,
 			MaxPollDelay:  4 * time.Second,
 			EDNS0Size:     c.edns0Size,
 		}
 	} else if c.noizMode && c.stealthMode {
-		// Stealth NoizDNS: slower polling with jitter and burst patterns
+		// Stealth NoizDNS: conservative polling with jitter and burst patterns
 		// to evade DPI fingerprinting. Trades latency for stealth.
 		edns0 := c.edns0Size
 		if edns0 == 0 {
@@ -550,7 +550,7 @@ func (c *DnsttClient) Start() error {
 		}
 		dnsConfig = &dnsttclient.DNSPacketConnConfig{
 			PollLimit:     16,
-			InitPollDelay: 200 * time.Millisecond,
+			InitPollDelay: 300 * time.Millisecond,
 			MaxPollDelay:  5 * time.Second,
 			PollJitter:    true,
 			BurstMode:     true,
@@ -564,7 +564,7 @@ func (c *DnsttClient) Start() error {
 		}
 		dnsConfig = &dnsttclient.DNSPacketConnConfig{
 			PollLimit:     16,
-			InitPollDelay: 150 * time.Millisecond,
+			InitPollDelay: 200 * time.Millisecond,
 			MaxPollDelay:  5 * time.Second,
 			EDNS0Size:     edns0,
 		}
@@ -1134,6 +1134,10 @@ func (c *DnsttClient) run(ctx context.Context, pubkey []byte, domain dns.Name, l
 		conn.SetNoDelay(1, 20, 2, 1)
 		conn.SetACKNoDelay(true)
 		conn.SetWindowSize(256, 256)
+	} else if c.noizMode && c.stealthMode {
+		// Stealth: moderate KCP — slower flush, smaller window to reduce burst size
+		conn.SetNoDelay(1, 40, 2, 1)
+		conn.SetWindowSize(128, 128)
 	} else if c.noizMode {
 		// NoizDNS: fast flush + fast retransmit for responsive SSH handshakes
 		conn.SetNoDelay(1, 30, 2, 1)
@@ -1160,6 +1164,10 @@ func (c *DnsttClient) run(ctx context.Context, pubkey []byte, domain dns.Name, l
 		// Aggressive: larger buffers for better throughput
 		smuxConfig.MaxStreamBuffer = 4 * 1024 * 1024   // 4MB (default 64KB)
 		smuxConfig.MaxReceiveBuffer = 16 * 1024 * 1024 // 16MB (default 4MB)
+	} else if c.noizMode && c.stealthMode {
+		// Stealth: moderate buffers
+		smuxConfig.MaxStreamBuffer = 512 * 1024 // 512KB
+		smuxConfig.MaxReceiveBuffer = 8 * 1024 * 1024 // 8MB
 	} else if c.noizMode {
 		// NoizDNS: larger buffers to reduce stalls on page loads
 		smuxConfig.MaxStreamBuffer = 1 * 1024 * 1024   // 1MB (default 64KB)
