@@ -534,12 +534,11 @@ func (c *DnsttClient) Start() error {
 	// Wrap the transport with DNSPacketConn for DNS encoding.
 	var dnsConfig *dnsttclient.DNSPacketConnConfig
 	if c.authoritativeMode {
-		// Authoritative: match upstream dnstt defaults to avoid tripping
-		// rate limits on corporate/private resolvers.
+		// Aggressive: faster polling for lower latency
 		dnsConfig = &dnsttclient.DNSPacketConnConfig{
 			PollLimit:     16,
-			InitPollDelay: 500 * time.Millisecond,
-			MaxPollDelay:  5 * time.Second,
+			InitPollDelay: 200 * time.Millisecond,
+			MaxPollDelay:  4 * time.Second,
 			EDNS0Size:     c.edns0Size,
 		}
 	} else if c.noizMode && c.stealthMode {
@@ -1093,28 +1092,15 @@ func (c *DnsttClient) run(ctx context.Context, pubkey []byte, domain dns.Name, l
 		ln.Close()
 	}()
 
-	// QNAME sizing:
-	// - Authoritative: full 255-byte QNAME (own resolver, no DPI concern)
-	// - Non-authoritative (stealth or not): 150-byte QNAME to avoid DPI detection
-	//   (255-byte QNAMEs are a classic DNS tunnel fingerprint on ISP resolvers)
+	// QNAME sizing: full 255-byte capacity for all modes.
+	// Users control query size via the DNS payload size setting in the app.
 	var nameCapacity int
-	if c.authoritativeMode {
-		nameCapacity = dnsNameCapacity(domain)
-	} else if c.stealthMode {
-		nameCapacity = noizdns.StealthNameCapacity(domain, 150)
+	if c.stealthMode {
+		nameCapacity = noizdns.StealthNameCapacity(domain, 255)
 	} else {
-		nameCapacity = dnsNameCapacityWithLimit(domain, 150)
+		nameCapacity = dnsNameCapacity(domain)
 	}
 	mtu := nameCapacity - 8 - 1 - numPadding - 1
-	if mtu < 80 {
-		// Fall back to full capacity if the domain is too long for the short limit.
-		if c.stealthMode {
-			nameCapacity = noizdns.StealthNameCapacity(domain, 255)
-		} else {
-			nameCapacity = dnsNameCapacity(domain)
-		}
-		mtu = nameCapacity - 8 - 1 - numPadding - 1
-	}
 	if mtu < 80 {
 		return fmt.Errorf("domain %s leaves only %d bytes for payload (MTU %d); try using a shorter tunnel domain", domain, mtu)
 	}
