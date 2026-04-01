@@ -84,6 +84,12 @@ type DnsttClient struct {
 	// Weighted (e.g. "3*Chrome_120,1*Firefox_120") = random from distribution.
 	utlsDistribution string
 
+	// tunnelCount is the number of parallel tunnel sessions to create.
+	// Each session has its own KCP/smux connection. Incoming SOCKS
+	// connections are distributed round-robin across sessions.
+	// 0 or 1 = single session (default, original behavior).
+	tunnelCount int
+
 	// socksUser/socksPass are injected automatically during the SOCKS5
 	// handshake so clients (browsers, curl) never need to provide credentials.
 	socksUser string
@@ -163,6 +169,17 @@ func (c *DnsttClient) SetNoizMode(enabled bool) {
 // Must be called before Start.
 func (c *DnsttClient) SetStealthMode(enabled bool) {
 	c.stealthMode = enabled
+}
+
+// SetTunnelCount sets the number of parallel tunnel sessions.
+// Each session has its own KCP/smux connection for independent throughput.
+// Incoming connections are distributed round-robin across sessions.
+// 0 or 1 = single session (default). Must be called before Start.
+func (c *DnsttClient) SetTunnelCount(count int) {
+	if count < 1 {
+		count = 1
+	}
+	c.tunnelCount = count
 }
 
 // SetMaxPayload caps the per-query payload size (KCP MTU) to produce
@@ -1110,128 +1127,177 @@ func (c *DnsttClient) run(ctx context.Context, pubkey []byte, domain dns.Name, l
 	}
 	log.Printf("effective MTU %d", mtu)
 
-	// Open a KCP conn on the PacketConn.
-	conn, err := kcp.NewConn2(remoteAddr, nil, 0, 0, pconn)
-	if err != nil {
-		return fmt.Errorf("opening KCP conn: %v", err)
+	// tunnelSession holds one KCP → Noise → smux pipeline.
+	type tunnelSession struct {
+		conn *kcp.UDPSession
+		sess *smux.Session
+		done <-chan struct{}
 	}
-	// Store KCP conn so Stop() can force-deadline it for fast shutdown.
+
+	// createSession opens a new KCP/Noise/smux session on the shared PacketConn.
+	createSession := func() (*tunnelSession, error) {
+		conn, err := kcp.NewConn2(remoteAddr, nil, 0, 0, pconn)
+		if err != nil {
+			return nil, fmt.Errorf("opening KCP conn: %v", err)
+		}
+		log.Printf("begin session %08x", conn.GetConv())
+
+		conn.SetStreamMode(true)
+		if c.authoritativeMode {
+			conn.SetNoDelay(1, 20, 2, 1)
+			conn.SetACKNoDelay(true)
+			conn.SetWindowSize(256, 256)
+		} else if c.noizMode && c.stealthMode {
+			conn.SetNoDelay(1, 40, 2, 1)
+			conn.SetWindowSize(128, 128)
+		} else if c.noizMode {
+			conn.SetNoDelay(1, 30, 2, 1)
+			conn.SetACKNoDelay(true)
+			conn.SetWindowSize(192, 192)
+		} else {
+			conn.SetNoDelay(0, 0, 0, 1)
+			conn.SetWindowSize(64, 64)
+		}
+		if rc := conn.SetMtu(mtu); !rc {
+			conn.Close()
+			return nil, fmt.Errorf("failed to set KCP MTU to %d", mtu)
+		}
+
+		rw, err := noise.NewClient(conn, pubkey)
+		if err != nil {
+			conn.Close()
+			return nil, err
+		}
+
+		smuxConfig := smux.DefaultConfig()
+		smuxConfig.Version = 2
+		smuxConfig.KeepAliveTimeout = idleTimeout
+		if c.authoritativeMode {
+			smuxConfig.MaxStreamBuffer = 4 * 1024 * 1024
+			smuxConfig.MaxReceiveBuffer = 16 * 1024 * 1024
+		} else if c.noizMode && c.stealthMode {
+			smuxConfig.MaxStreamBuffer = 512 * 1024
+			smuxConfig.MaxReceiveBuffer = 8 * 1024 * 1024
+		} else if c.noizMode {
+			smuxConfig.MaxStreamBuffer = 1 * 1024 * 1024
+			smuxConfig.MaxReceiveBuffer = 16 * 1024 * 1024
+		} else {
+			smuxConfig.KeepAliveInterval = 30 * time.Second
+		}
+		sess, err := smux.Client(rw, smuxConfig)
+		if err != nil {
+			conn.Close()
+			return nil, fmt.Errorf("opening smux session: %v", err)
+		}
+
+		return &tunnelSession{conn: conn, sess: sess, done: sess.CloseChan()}, nil
+	}
+
+	// Create tunnel sessions (1 by default, more if tunnelCount > 1).
+	numTunnels := c.tunnelCount
+	if numTunnels < 1 {
+		numTunnels = 1
+	}
+
+	sessions := make([]*tunnelSession, 0, numTunnels)
+	for i := 0; i < numTunnels; i++ {
+		ts, err := createSession()
+		if err != nil {
+			// Close any sessions we already created.
+			for _, s := range sessions {
+				s.sess.Close()
+				s.conn.Close()
+			}
+			if i == 0 {
+				return fmt.Errorf("creating tunnel session: %v", err)
+			}
+			// At least one session succeeded — continue with what we have.
+			log.Printf("warning: only %d/%d tunnel sessions created: %v", i, numTunnels, err)
+			break
+		}
+		sessions = append(sessions, ts)
+	}
+	if len(sessions) == 0 {
+		return fmt.Errorf("no tunnel sessions created")
+	}
+	// Store first KCP conn for Stop() deadline forcing.
 	c.mu.Lock()
-	c.kcpConn = conn
+	c.kcpConn = sessions[0].conn
 	c.mu.Unlock()
 	defer func() {
-		log.Printf("end session %08x", conn.GetConv())
-		conn.Close()
+		for _, ts := range sessions {
+			log.Printf("end session %08x", ts.conn.GetConv())
+			ts.sess.Close()
+			ts.conn.Close()
+		}
 		c.mu.Lock()
 		c.kcpConn = nil
 		c.mu.Unlock()
 	}()
-	log.Printf("begin session %08x", conn.GetConv())
-
-	conn.SetStreamMode(true)
-	if c.authoritativeMode {
-		// Aggressive: KCP turbo mode — 20ms flush, fast retransmit, 30ms min RTO
-		conn.SetNoDelay(1, 20, 2, 1)
-		conn.SetACKNoDelay(true)
-		conn.SetWindowSize(256, 256)
-	} else if c.noizMode && c.stealthMode {
-		// Stealth: moderate KCP — slower flush, smaller window to reduce burst size
-		conn.SetNoDelay(1, 40, 2, 1)
-		conn.SetWindowSize(128, 128)
-	} else if c.noizMode {
-		// NoizDNS: fast flush + fast retransmit for responsive SSH handshakes
-		conn.SetNoDelay(1, 30, 2, 1)
-		conn.SetACKNoDelay(true)
-		conn.SetWindowSize(192, 192)
-	} else {
-		conn.SetNoDelay(0, 0, 0, 1)
-		conn.SetWindowSize(64, 64)
-	}
-	if rc := conn.SetMtu(mtu); !rc {
-		return fmt.Errorf("failed to set KCP MTU to %d", mtu)
+	if len(sessions) > 1 {
+		log.Printf("parallel tunnels: %d sessions active", len(sessions))
 	}
 
-	// Put a Noise channel on top of the KCP conn.
-	rw, err := noise.NewClient(conn, pubkey)
-	if err != nil {
-		return err
-	}
-
-	smuxConfig := smux.DefaultConfig()
-	smuxConfig.Version = 2
-	smuxConfig.KeepAliveTimeout = idleTimeout
-	if c.authoritativeMode {
-		// Aggressive: larger buffers for better throughput
-		smuxConfig.MaxStreamBuffer = 4 * 1024 * 1024   // 4MB (default 64KB)
-		smuxConfig.MaxReceiveBuffer = 16 * 1024 * 1024 // 16MB (default 4MB)
-	} else if c.noizMode && c.stealthMode {
-		// Stealth: moderate buffers
-		smuxConfig.MaxStreamBuffer = 512 * 1024 // 512KB
-		smuxConfig.MaxReceiveBuffer = 8 * 1024 * 1024 // 8MB
-	} else if c.noizMode {
-		// NoizDNS: larger buffers to reduce stalls on page loads
-		smuxConfig.MaxStreamBuffer = 1 * 1024 * 1024   // 1MB (default 64KB)
-		smuxConfig.MaxReceiveBuffer = 16 * 1024 * 1024 // 16MB (default 4MB)
-	} else {
-		// Plain DNSTT: reduce smux keepalive frequency to save battery/data.
-		smuxConfig.KeepAliveInterval = 30 * time.Second
-	}
-	sess, err := smux.Client(rw, smuxConfig)
-	if err != nil {
-		return fmt.Errorf("opening smux session: %v", err)
-	}
-	defer sess.Close()
-
-	// Aggressive mode: 128KB copy buffer (default 32KB)
 	copyBufSize := 0
 	if c.authoritativeMode {
 		copyBufSize = 128 * 1024
 	}
 
-	// Stream limiter: cap concurrent smux streams to prevent tunnel overload.
-	// Browsers open 20-40+ connections per page; without a cap each becomes
-	// a smux stream that floods the bandwidth-constrained DNS tunnel.
 	var streamSem chan struct{}
 	if !c.authoritativeMode {
 		streamSem = make(chan struct{}, 32)
 	}
-	// authoritativeMode: no limit (high-bandwidth self-hosted resolver)
 
-	sessDone := sess.CloseChan()
+	var rrCounter uint64
 
 	for {
-		// Set a deadline so Accept unblocks periodically for session
-		// health checks. Without this, a dead session isn't detected
-		// until the next incoming connection (could be minutes).
 		ln.SetDeadline(time.Now().Add(2 * time.Second))
 		local, err := ln.Accept()
 		if err != nil {
 			if ctx.Err() != nil {
-				return nil // Shutdown requested.
+				return nil
 			}
 			if ne, ok := err.(net.Error); ok && ne.Timeout() {
-				// Check if session died while we were waiting.
-				select {
-				case <-sessDone:
-					return fmt.Errorf("session %08x closed", conn.GetConv())
-				default:
-					continue
+				// Check if ALL sessions are dead.
+				allDead := true
+				for _, ts := range sessions {
+					select {
+					case <-ts.done:
+					default:
+						allDead = false
+					}
 				}
+				if allDead {
+					return fmt.Errorf("all %d tunnel sessions closed", len(sessions))
+				}
+				continue
 			}
 			if err, ok := err.(net.Error); ok && err.Temporary() {
 				continue
 			}
 			return err
 		}
-		// Check between accepted connections too.
-		select {
-		case <-sessDone:
-			local.Close()
-			return fmt.Errorf("session %08x closed", conn.GetConv())
-		default:
+
+		// Pick an alive session via round-robin.
+		n := uint64(len(sessions))
+		start := rrCounter
+		rrCounter++
+		var picked *tunnelSession
+		for i := uint64(0); i < n; i++ {
+			ts := sessions[(start+i)%n]
+			select {
+			case <-ts.done:
+				continue // session dead, skip
+			default:
+				picked = ts
+				break
+			}
 		}
-		// Non-blocking: reject immediately if at capacity.
-		// Keeps the accept loop responsive for other connections.
+		if picked == nil {
+			local.Close()
+			return fmt.Errorf("all %d tunnel sessions closed", len(sessions))
+		}
+
 		if streamSem != nil {
 			select {
 			case streamSem <- struct{}{}:
@@ -1240,12 +1306,14 @@ func (c *DnsttClient) run(ctx context.Context, pubkey []byte, domain dns.Name, l
 				continue
 			}
 		}
+		sess := picked.sess
+		conv := picked.conn.GetConv()
 		go func() {
 			defer local.Close()
 			if streamSem != nil {
 				defer func() { <-streamSem }()
 			}
-			err := handle(local.(*net.TCPConn), sess, conn.GetConv(), copyBufSize, c.socksUser, c.socksPass)
+			err := handle(local.(*net.TCPConn), sess, conv, copyBufSize, c.socksUser, c.socksPass)
 			if err != nil && !sess.IsClosed() {
 				log.Printf("handle: %v", err)
 			}
