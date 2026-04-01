@@ -534,11 +534,12 @@ func (c *DnsttClient) Start() error {
 	// Wrap the transport with DNSPacketConn for DNS encoding.
 	var dnsConfig *dnsttclient.DNSPacketConnConfig
 	if c.authoritativeMode {
-		// Aggressive: faster polling for lower latency
+		// Authoritative: match upstream dnstt defaults to avoid tripping
+		// rate limits on corporate/private resolvers.
 		dnsConfig = &dnsttclient.DNSPacketConnConfig{
 			PollLimit:     16,
-			InitPollDelay: 200 * time.Millisecond,
-			MaxPollDelay:  4 * time.Second,
+			InitPollDelay: 500 * time.Millisecond,
+			MaxPollDelay:  5 * time.Second,
 			EDNS0Size:     c.edns0Size,
 		}
 	} else if c.noizMode && c.stealthMode {
