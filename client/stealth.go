@@ -108,7 +108,7 @@ func sendQuery(labels dns.Name, edns0Size int, transport net.PacketConn, addr ne
 	}
 	var id uint16
 	_ = binary.Read(rand.Reader, binary.BigEndian, &id)
-	ec := uint16(4096)
+	ec := uint16(1232)
 	if edns0Size > 0 {
 		ec = uint16(edns0Size)
 	}

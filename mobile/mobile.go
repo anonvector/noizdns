@@ -546,7 +546,7 @@ func (c *DnsttClient) Start() error {
 		// to evade DPI fingerprinting. Trades latency for stealth.
 		edns0 := c.edns0Size
 		if edns0 == 0 {
-			edns0 = 4096
+			edns0 = 1232
 		}
 		dnsConfig = &dnsttclient.DNSPacketConnConfig{
 			PollLimit:     16,
@@ -560,7 +560,7 @@ func (c *DnsttClient) Start() error {
 		// NoizDNS: responsive polling for fast SSH handshakes and data transfer
 		edns0 := c.edns0Size
 		if edns0 == 0 {
-			edns0 = 4096
+			edns0 = 1232
 		}
 		dnsConfig = &dnsttclient.DNSPacketConnConfig{
 			PollLimit:     16,
@@ -595,7 +595,7 @@ func (c *DnsttClient) Start() error {
 		clientID := turbotunnel.NewClientID()
 		edns0 := c.edns0Size
 		if edns0 == 0 {
-			edns0 = 4096
+			edns0 = 1232
 		}
 		if c.stealthMode {
 			sender := &noizdns.StealthSender{
