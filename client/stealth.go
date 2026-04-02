@@ -12,6 +12,7 @@ import (
 	"encoding/base32"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"net"
 
 	"www.bamsoftware.com/git/dnstt.git/dns"
@@ -66,14 +67,29 @@ func (s *StealthSender) Send(transport net.PacketConn, p []byte, addr net.Addr) 
 	return sendQuery(labels, s.EDNS0Size, transport, addr)
 }
 
-// encodePayload builds the base32-encoded QNAME payload with zero padding.
+// numPaddingForPoll is the number of random padding bytes added to empty poll
+// queries to prevent ISP resolver caching. Data queries vary naturally and
+// don't need extra padding. Must match dnstt's numPaddingForPoll.
+const numPaddingForPoll = 8
+
+// encodePayload builds the base32-encoded QNAME payload. Poll queries (empty p)
+// get random padding to ensure unique QNAMEs and prevent resolver cache hits.
 func encodePayload(clientID turbotunnel.ClientID, p []byte) ([]byte, error) {
 	if len(p) >= 224 {
 		return nil, fmt.Errorf("payload too long: %d >= 224", len(p))
 	}
+	// Poll queries need random padding to avoid identical QNAMEs that
+	// ISP resolvers would cache, stalling the tunnel.
+	n := 0
+	if len(p) == 0 {
+		n = numPaddingForPoll
+	}
 	var buf bytes.Buffer
 	buf.Write(clientID[:])
-	buf.WriteByte(224) // zero padding
+	buf.WriteByte(byte(224 + n))
+	if n > 0 {
+		_, _ = io.CopyN(&buf, rand.Reader, int64(n))
+	}
 	if len(p) > 0 {
 		buf.WriteByte(byte(len(p)))
 		buf.Write(p)
@@ -92,7 +108,7 @@ func sendQuery(labels dns.Name, edns0Size int, transport net.PacketConn, addr ne
 	}
 	var id uint16
 	_ = binary.Read(rand.Reader, binary.BigEndian, &id)
-	ec := uint16(1232)
+	ec := uint16(4096)
 	if edns0Size > 0 {
 		ec = uint16(edns0Size)
 	}
