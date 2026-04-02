@@ -544,29 +544,19 @@ func (c *DnsttClient) Start() error {
 	} else if c.noizMode && c.stealthMode {
 		// Stealth NoizDNS: conservative polling with jitter and burst patterns
 		// to evade DPI fingerprinting. Trades latency for stealth.
-		edns0 := c.edns0Size
-		if edns0 == 0 {
-			edns0 = 1232
-		}
 		dnsConfig = &dnsttclient.DNSPacketConnConfig{
 			PollLimit:     16,
 			InitPollDelay: 300 * time.Millisecond,
 			MaxPollDelay:  5 * time.Second,
 			PollJitter:    true,
 			BurstMode:     true,
-			EDNS0Size:     edns0,
 		}
 	} else if c.noizMode {
 		// NoizDNS: responsive polling for fast SSH handshakes and data transfer
-		edns0 := c.edns0Size
-		if edns0 == 0 {
-			edns0 = 1232
-		}
 		dnsConfig = &dnsttclient.DNSPacketConnConfig{
 			PollLimit:     16,
 			InitPollDelay: 200 * time.Millisecond,
 			MaxPollDelay:  5 * time.Second,
-			EDNS0Size:     edns0,
 		}
 	} else {
 		// Plain DNSTT: upstream defaults
