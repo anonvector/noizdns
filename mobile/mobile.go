@@ -96,6 +96,15 @@ type DnsttClient struct {
 	socksProxyUser string
 	socksProxyPass string
 
+	// resolverMode controls multi-resolver query distribution.
+	// "fanout" (default) sends to all alive resolvers.
+	// "roundrobin" sends to one resolver at a time for bandwidth aggregation.
+	resolverMode ResolverMode
+
+	// rrSpreadCount controls how many resolvers each query is sent to in
+	// round-robin mode. Default 3 (1 primary + 2 redundant). Minimum 1.
+	rrSpreadCount int
+
 	mu            sync.Mutex
 	running       bool
 	cancel        context.CancelFunc
@@ -204,6 +213,29 @@ func (c *DnsttClient) SetDeviceManufacturer(manufacturer string) {
 func (c *DnsttClient) SetSocksCredentials(user, pass string) {
 	c.socksUser = user
 	c.socksPass = pass
+}
+
+// SetResolverMode sets the multi-resolver query distribution mode.
+// "fanout" (default) sends to all alive resolvers for reliability.
+// "roundrobin" sends to one resolver at a time for bandwidth aggregation.
+// Must be called before Start.
+func (c *DnsttClient) SetResolverMode(mode string) {
+	switch ResolverMode(mode) {
+	case ModeRoundRobin:
+		c.resolverMode = ModeRoundRobin
+	default:
+		c.resolverMode = ModeFanout
+	}
+}
+
+// SetRRSpreadCount sets how many resolvers each query is sent to in
+// round-robin mode (1 primary + N-1 redundant). Default 3. Minimum 1.
+// Has no effect in fanout mode. Must be called before Start.
+func (c *DnsttClient) SetRRSpreadCount(n int64) {
+	if n < 1 {
+		n = 3
+	}
+	c.rrSpreadCount = int(n)
 }
 
 // SetSOCKS5Proxy configures an upstream SOCKS5 proxy for DNS transport
@@ -388,8 +420,8 @@ func (c *DnsttClient) Start() error {
 				transports = append(transports, t)
 				tAddrs = append(tAddrs, turbotunnel.DummyAddr{})
 			}
-			pconn = NewSmartMultiPacketConn(transports, tAddrs)
-			log.Printf("multi-resolver DoT: %d transports (smart)", len(transports))
+			pconn = NewSmartMultiPacketConn(transports, tAddrs, c.resolverMode, c.rrSpreadCount)
+			log.Printf("multi-resolver DoT: %d transports (mode=%s, spread=%d)", len(transports), c.resolverMode, c.rrSpreadCount)
 		}
 		remoteAddr = turbotunnel.DummyAddr{}
 
@@ -438,8 +470,8 @@ func (c *DnsttClient) Start() error {
 				transports = append(transports, t)
 				tAddrs = append(tAddrs, turbotunnel.DummyAddr{})
 			}
-			pconn = NewSmartMultiPacketConn(transports, tAddrs)
-			log.Printf("multi-resolver TCP: %d transports (smart)", len(transports))
+			pconn = NewSmartMultiPacketConn(transports, tAddrs, c.resolverMode, c.rrSpreadCount)
+			log.Printf("multi-resolver TCP: %d transports (mode=%s, spread=%d)", len(transports), c.resolverMode, c.rrSpreadCount)
 		}
 		remoteAddr = turbotunnel.DummyAddr{}
 
@@ -483,8 +515,8 @@ func (c *DnsttClient) Start() error {
 					transports = append(transports, t)
 					tAddrs = append(tAddrs, turbotunnel.DummyAddr{})
 				}
-				pconn = NewSmartMultiPacketConn(transports, tAddrs)
-				log.Printf("multi-resolver TCP (promoted from UDP): %d transports (smart)", len(transports))
+				pconn = NewSmartMultiPacketConn(transports, tAddrs, c.resolverMode, c.rrSpreadCount)
+				log.Printf("multi-resolver TCP (promoted from UDP): %d transports (mode=%s, spread=%d)", len(transports), c.resolverMode, c.rrSpreadCount)
 			}
 			remoteAddr = turbotunnel.DummyAddr{}
 		} else {
@@ -512,21 +544,21 @@ func (c *DnsttClient) Start() error {
 					}
 					udpAddrs = append(udpAddrs, addr)
 				}
-				sconn, sErr := NewSmartUDPConn(udpAddrs)
+				sconn, sErr := NewSmartUDPConn(udpAddrs, c.resolverMode, c.rrSpreadCount)
 				if sErr != nil {
 					cancel()
 					return fmt.Errorf("opening UDP socket: %v", sErr)
 				}
 				pconn = sconn
 				remoteAddr = turbotunnel.DummyAddr{}
-				log.Printf("multi-resolver UDP: %d resolvers (smart)", len(udpAddrs))
+				log.Printf("multi-resolver UDP: %d resolvers (mode=%s)", len(udpAddrs), c.resolverMode)
 			}
 		}
 	}
 
 	// Save the raw transport conn so we can close it explicitly. The
 	// wrapping layers (DNSPacketConn, AddrNormConn) don't propagate
-	// Close to the underlying transport, so PerQueryUDPConn/SmartMultiPacketConn
+	// Close to the underlying transport, so SmartUDPConn/SmartMultiPacketConn
 	// would leak their healthLoop goroutine without this.
 	transportConn := pconn
 	c.transportConn = pconn // also store on struct so Stop() can close it immediately
@@ -544,19 +576,29 @@ func (c *DnsttClient) Start() error {
 	} else if c.noizMode && c.stealthMode {
 		// Stealth NoizDNS: conservative polling with jitter and burst patterns
 		// to evade DPI fingerprinting. Trades latency for stealth.
+		edns0 := c.edns0Size
+		if edns0 == 0 {
+			edns0 = 1232
+		}
 		dnsConfig = &dnsttclient.DNSPacketConnConfig{
 			PollLimit:     16,
 			InitPollDelay: 300 * time.Millisecond,
 			MaxPollDelay:  5 * time.Second,
 			PollJitter:    true,
 			BurstMode:     true,
+			EDNS0Size:     edns0,
 		}
 	} else if c.noizMode {
 		// NoizDNS: responsive polling for fast SSH handshakes and data transfer
+		edns0 := c.edns0Size
+		if edns0 == 0 {
+			edns0 = 1232
+		}
 		dnsConfig = &dnsttclient.DNSPacketConnConfig{
 			PollLimit:     16,
 			InitPollDelay: 200 * time.Millisecond,
 			MaxPollDelay:  5 * time.Second,
+			EDNS0Size:     edns0,
 		}
 	} else {
 		// Plain DNSTT: upstream defaults

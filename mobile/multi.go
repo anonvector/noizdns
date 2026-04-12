@@ -4,10 +4,7 @@ import (
 	"log"
 	"net"
 	"sync"
-	"sync/atomic"
 	"time"
-
-	"www.bamsoftware.com/git/dnstt.git/dns"
 )
 
 const (
@@ -16,9 +13,13 @@ const (
 	// Set high enough to tolerate congested/high-latency networks common
 	// in censored regions, while still detecting truly dead resolvers.
 	deadTimeout = 12 * time.Second
+	// fastDeadTimeout is how long a resolver that has NEVER responded can
+	// keep sending before being marked dead. Higher than the health check
+	// interval to tolerate slow initial handshakes on flaky networks.
+	fastDeadTimeout = 6 * time.Second
 	// probeInterval is the minimum gap between sending probe traffic to a
 	// dead resolver to check whether it has recovered.
-	probeInterval = 15 * time.Second
+	probeInterval = 8 * time.Second
 	// healthCheckInterval is how often the background health loop runs.
 	healthCheckInterval = 3 * time.Second
 )
@@ -33,13 +34,25 @@ type resolverState struct {
 	everRecved bool      // true once any response has been received
 }
 
+// ResolverMode controls how queries are distributed across resolvers.
+type ResolverMode string
+
+const (
+	// ModeFanout sends each query to ALL alive resolvers (reliable, higher latency tolerance).
+	ModeFanout ResolverMode = "fanout"
+	// ModeRoundRobin sends each query to ONE alive resolver in rotation (faster, bandwidth aggregation).
+	ModeRoundRobin ResolverMode = "roundrobin"
+)
+
 // resolverTracker provides shared health-tracking logic for smart connectors.
 // It maintains per-resolver state and picks the best resolver for each query.
 type resolverTracker struct {
-	mu       sync.Mutex
-	states   []resolverState
-	stopCh   chan struct{}
-	stopOnce sync.Once
+	mu        sync.Mutex
+	states    []resolverState
+	rrIndex   int // round-robin cursor for primary in pickOne
+	rrSecIdx  int // round-robin cursor for secondary in pickOne
+	stopCh    chan struct{}
+	stopOnce  sync.Once
 }
 
 func newResolverTracker(n int) *resolverTracker {
@@ -143,11 +156,10 @@ func (t *resolverTracker) checkHealth() {
 		if !s.alive || s.lastSend.IsZero() {
 			continue
 		}
-		// Fast path: if we've been sending for 3+ seconds and never got
-		// a single response, mark dead immediately so traffic shifts to
-		// working resolvers during initial connection.
+		// Fast path: if we've been sending for fastDeadTimeout and never got
+		// a single response, mark dead so traffic shifts to working resolvers.
 		if !s.everRecved && !s.firstSend.IsZero() &&
-			now.Sub(s.firstSend) > 3*time.Second {
+			now.Sub(s.firstSend) > fastDeadTimeout {
 			log.Printf("resolver %d marked dead (never responded, sent for %v)", i, now.Sub(s.firstSend).Round(time.Second))
 			s.alive = false
 			continue
@@ -161,6 +173,111 @@ func (t *resolverTracker) checkHealth() {
 	}
 }
 
+// pickOne selects a primary alive resolver via round-robin and a secondary
+// alive resolver via an independent cursor for fastest-wins redundancy.
+// Returns primary and secondary indices (-1 if no secondary available).
+func (t *resolverTracker) pickOne() (primary int, secondary int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	secondary = -1
+	n := len(t.states)
+
+	// Find primary alive resolver via round-robin.
+	primary = -1
+	for i := 0; i < n; i++ {
+		idx := (t.rrIndex + i) % n
+		if t.states[idx].alive {
+			primary = idx
+			t.rrIndex = (idx + 1) % n
+			break
+		}
+	}
+	if primary == -1 {
+		primary = t.rrIndex % n
+		t.rrIndex = (primary + 1) % n
+	}
+
+	// Find secondary alive resolver via its own cursor (skip primary).
+	for i := 0; i < n; i++ {
+		idx := (t.rrSecIdx + i) % n
+		if idx != primary && t.states[idx].alive {
+			secondary = idx
+			t.rrSecIdx = (idx + 1) % n
+			break
+		}
+	}
+
+	// No alive secondary — probe a dead resolver instead.
+	if secondary == -1 {
+		now := time.Now()
+		for i := 1; i < n; i++ {
+			idx := (primary + i) % n
+			if now.Sub(t.states[idx].lastProbe) >= probeInterval {
+				t.states[idx].lastProbe = now
+				secondary = idx
+				break
+			}
+		}
+	}
+
+	return primary, secondary
+}
+
+// pickSpread selects up to maxTargets alive resolvers via round-robin for
+// spread redundancy. If fewer than 2 alive resolvers are available, a dead
+// resolver due for probing is included so recovery can be detected.
+func (t *resolverTracker) pickSpread(maxTargets int) []int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	n := len(t.states)
+	targets := make([]int, 0, maxTargets)
+
+	// Pick alive resolvers via round-robin. Advance cursor by 1 so
+	// successive calls start from different resolvers (bandwidth aggregation).
+	for i := 0; i < n && len(targets) < maxTargets; i++ {
+		idx := (t.rrIndex + i) % n
+		if t.states[idx].alive {
+			targets = append(targets, idx)
+		}
+	}
+	if len(targets) > 0 {
+		t.rrIndex = (targets[0] + 1) % n
+	}
+
+	// If we couldn't fill 2 targets, probe a dead resolver for recovery.
+	if len(targets) < 2 {
+		now := time.Now()
+		for i := 0; i < n; i++ {
+			idx := (t.rrIndex + i) % n
+			if !t.states[idx].alive && now.Sub(t.states[idx].lastProbe) >= probeInterval {
+				already := false
+				for _, ti := range targets {
+					if ti == idx {
+						already = true
+						break
+					}
+				}
+				if !already {
+					t.states[idx].lastProbe = now
+					targets = append(targets, idx)
+					break
+				}
+			}
+		}
+	}
+
+	// Fallback: nothing found — use current cursor.
+	if len(targets) == 0 {
+		idx := t.rrIndex % n
+		targets = append(targets, idx)
+		t.rrIndex = (idx + 1) % n
+	}
+
+	return targets
+}
+
 func (t *resolverTracker) close() {
 	t.stopOnce.Do(func() { close(t.stopCh) })
 }
@@ -169,18 +286,20 @@ func (t *resolverTracker) close() {
 // SmartUDPConn — persistent socket, fan-out to all alive resolvers
 // ---------------------------------------------------------------------------
 
-// SmartUDPConn wraps a single UDP socket and fans out each query to ALL alive
-// resolvers simultaneously. KCP deduplicates responses, so the fastest reply
-// wins. Dead resolvers are periodically probed for recovery.
+// SmartUDPConn wraps a single UDP socket and distributes queries across
+// resolvers. In fanout mode it sends to ALL alive resolvers (KCP deduplicates).
+// In round-robin mode it sends to ONE alive resolver for bandwidth aggregation.
 type SmartUDPConn struct {
-	conn    *net.UDPConn
-	addrs   []*net.UDPAddr
-	addrMap map[string]int // IP:port → index for markRecv
-	tracker *resolverTracker
+	conn        *net.UDPConn
+	addrs       []*net.UDPAddr
+	addrMap     map[string]int // IP:port → index for markRecv
+	tracker     *resolverTracker
+	mode        ResolverMode
+	spreadCount int // max targets in round-robin mode (default 3)
 }
 
 // NewSmartUDPConn creates a smart UDP conn that distributes queries across resolvers.
-func NewSmartUDPConn(addrs []*net.UDPAddr) (*SmartUDPConn, error) {
+func NewSmartUDPConn(addrs []*net.UDPAddr, mode ResolverMode, spreadCount int) (*SmartUDPConn, error) {
 	conn, err := net.ListenUDP("udp", nil)
 	if err != nil {
 		return nil, err
@@ -189,15 +308,31 @@ func NewSmartUDPConn(addrs []*net.UDPAddr) (*SmartUDPConn, error) {
 	for i, a := range addrs {
 		addrMap[a.String()] = i
 	}
+	if spreadCount < 1 {
+		spreadCount = 3
+	}
 	return &SmartUDPConn{
-		conn:    conn,
-		addrs:   addrs,
-		addrMap: addrMap,
-		tracker: newResolverTracker(len(addrs)),
+		conn:        conn,
+		addrs:       addrs,
+		addrMap:     addrMap,
+		tracker:     newResolverTracker(len(addrs)),
+		mode:        mode,
+		spreadCount: spreadCount,
 	}, nil
 }
 
 func (s *SmartUDPConn) WriteTo(p []byte, _ net.Addr) (int, error) {
+	if s.mode == ModeRoundRobin {
+		targets := s.tracker.pickSpread(s.spreadCount)
+		s.tracker.markSent(targets[0])
+		n, err := s.conn.WriteTo(p, s.addrs[targets[0]])
+		for _, idx := range targets[1:] {
+			s.tracker.markSent(idx)
+			s.conn.WriteTo(p, s.addrs[idx]) // best-effort redundancy
+		}
+		return n, err
+	}
+	// Fanout: send to all alive resolvers.
 	targets := s.tracker.pickAlive()
 	var lastN int
 	var lastErr error
@@ -238,353 +373,7 @@ func (s *SmartUDPConn) SetReadDeadline(t time.Time) error  { return s.conn.SetRe
 func (s *SmartUDPConn) SetWriteDeadline(t time.Time) error { return s.conn.SetWriteDeadline(t) }
 
 // ---------------------------------------------------------------------------
-// PerQueryUDPConn — per-query fresh sockets with forged response filtering
-// ---------------------------------------------------------------------------
-
-const (
-	// udpWorkers is the number of worker goroutines in the pool.
-	// Each worker handles one query at a time on a fresh UDP socket.
-	udpWorkers = 64
-	// udpReadTimeout is how long a worker waits for a valid response
-	// after sending a query. Must be long enough for a real response to
-	// arrive after skipping forged injections, but short enough that
-	// stale workers don't accumulate.
-	udpReadTimeout = 1500 * time.Millisecond
-)
-
-// ForgedStats tracks censorship-injected DNS responses.
-type ForgedStats struct {
-	SERVFAIL int64
-	NXDOMAIN int64
-	Other    int64
-	Valid    int64
-}
-
-// udpWork is a unit of work for a per-query UDP worker.
-type udpWork struct {
-	payload []byte
-	addr    *net.UDPAddr
-	idx     int // resolver index for health tracking
-}
-
-// udpResponse is a valid response from a per-query UDP worker.
-type udpResponse struct {
-	data []byte
-	n    int
-	addr net.Addr
-}
-
-// PerQueryUDPConn creates a fresh UDP socket for every outgoing DNS query,
-// randomizing source ports to defeat fingerprinting by source-port correlation.
-// Each worker also filters forged responses (SERVFAIL/NXDOMAIN injections)
-// by reading in a loop until a valid response arrives or timeout.
-type PerQueryUDPConn struct {
-	addrs   []*net.UDPAddr
-	addrMap map[string]int
-	tracker *resolverTracker
-
-	workCh    chan udpWork
-	recvCh    chan udpResponse
-	closeCh   chan struct{}
-	closeOnce sync.Once
-	wg        sync.WaitGroup
-
-	// Forged response counters (atomic).
-	forgedSERVFAIL int64
-	forgedNXDOMAIN int64
-	forgedOther    int64
-	validCount     int64
-}
-
-// NewPerQueryUDPConn creates a per-query UDP conn with a worker pool.
-func NewPerQueryUDPConn(addrs []*net.UDPAddr) *PerQueryUDPConn {
-	addrMap := make(map[string]int, len(addrs))
-	for i, a := range addrs {
-		addrMap[a.String()] = i
-	}
-	s := &PerQueryUDPConn{
-		addrs:   addrs,
-		addrMap: addrMap,
-		tracker: newResolverTracker(len(addrs)),
-		workCh:  make(chan udpWork, 256),
-		recvCh:  make(chan udpResponse, 256),
-		closeCh: make(chan struct{}),
-	}
-	s.wg.Add(udpWorkers)
-	for i := 0; i < udpWorkers; i++ {
-		go s.worker()
-	}
-	return s
-}
-
-// worker processes send-and-receive jobs on fresh UDP sockets.
-func (s *PerQueryUDPConn) worker() {
-	defer s.wg.Done()
-	for {
-		select {
-		case work, ok := <-s.workCh:
-			if !ok {
-				return
-			}
-			s.handleQuery(work)
-		case <-s.closeCh:
-			return
-		}
-	}
-}
-
-// handleQuery sends a DNS query on a fresh socket and reads responses,
-// skipping forged injections (SERVFAIL/NXDOMAIN) until a valid response
-// arrives or the deadline expires.
-func (s *PerQueryUDPConn) handleQuery(work udpWork) {
-	conn, err := net.DialUDP("udp", nil, work.addr)
-	if err != nil {
-		return
-	}
-	defer conn.Close()
-
-	_, err = conn.Write(work.payload)
-	if err != nil {
-		return
-	}
-
-	deadline := time.Now().Add(udpReadTimeout)
-	conn.SetReadDeadline(deadline)
-	var buf [4096]byte
-
-	for {
-		n, err := conn.Read(buf[:])
-		if err != nil {
-			return
-		}
-
-		if n >= 4 {
-			rcode := int(buf[3]) & 0x0f
-			switch rcode {
-			case dns.RcodeServerFailure:
-				atomic.AddInt64(&s.forgedSERVFAIL, 1)
-				continue // skip forged injection, wait for real response
-			case dns.RcodeNameError:
-				atomic.AddInt64(&s.forgedNXDOMAIN, 1)
-				continue // skip forged injection, wait for real response
-			case dns.RcodeNoError:
-				atomic.AddInt64(&s.validCount, 1)
-			default:
-				atomic.AddInt64(&s.forgedOther, 1)
-			}
-		}
-
-		s.tracker.markRecv(work.idx)
-
-		resp := udpResponse{
-			data: make([]byte, n),
-			n:    n,
-			addr: work.addr,
-		}
-		copy(resp.data, buf[:n])
-
-		select {
-		case s.recvCh <- resp:
-		case <-s.closeCh:
-		}
-		return
-	}
-}
-
-func (s *PerQueryUDPConn) WriteTo(p []byte, _ net.Addr) (int, error) {
-	targets := s.tracker.pickAlive()
-	for _, idx := range targets {
-		s.tracker.markSent(idx)
-		// Copy payload — workers may run concurrently after we return.
-		payload := make([]byte, len(p))
-		copy(payload, p)
-		select {
-		case s.workCh <- udpWork{payload: payload, addr: s.addrs[idx], idx: idx}:
-		case <-s.closeCh:
-			return 0, net.ErrClosed
-		}
-	}
-	return len(p), nil
-}
-
-func (s *PerQueryUDPConn) ReadFrom(p []byte) (int, net.Addr, error) {
-	select {
-	case resp, ok := <-s.recvCh:
-		if !ok {
-			return 0, nil, net.ErrClosed
-		}
-		return copy(p, resp.data), resp.addr, nil
-	case <-s.closeCh:
-		return 0, nil, net.ErrClosed
-	}
-}
-
-func (s *PerQueryUDPConn) Close() error {
-	s.closeOnce.Do(func() {
-		s.tracker.close()
-		close(s.closeCh)
-		s.wg.Wait()
-		close(s.recvCh)
-	})
-	return nil
-}
-
-// ForgedResponseStats returns a snapshot of forged response counters.
-func (s *PerQueryUDPConn) ForgedResponseStats() ForgedStats {
-	return ForgedStats{
-		SERVFAIL: atomic.LoadInt64(&s.forgedSERVFAIL),
-		NXDOMAIN: atomic.LoadInt64(&s.forgedNXDOMAIN),
-		Other:    atomic.LoadInt64(&s.forgedOther),
-		Valid:    atomic.LoadInt64(&s.validCount),
-	}
-}
-
-func (s *PerQueryUDPConn) LocalAddr() net.Addr                { return nil }
-func (s *PerQueryUDPConn) SetDeadline(t time.Time) error      { return nil }
-func (s *PerQueryUDPConn) SetReadDeadline(t time.Time) error  { return nil }
-func (s *PerQueryUDPConn) SetWriteDeadline(t time.Time) error { return nil }
-
-// ---------------------------------------------------------------------------
-// SinglePerQueryUDPConn — per-query sockets for a single resolver
-// ---------------------------------------------------------------------------
-
-// SinglePerQueryUDPConn is like PerQueryUDPConn but for a single resolver.
-// Avoids the overhead of multi-resolver health tracking.
-type SinglePerQueryUDPConn struct {
-	addr      *net.UDPAddr
-	workCh    chan []byte
-	recvCh    chan udpResponse
-	closeCh   chan struct{}
-	closeOnce sync.Once
-	wg        sync.WaitGroup
-
-	forgedSERVFAIL int64
-	forgedNXDOMAIN int64
-	forgedOther    int64
-	validCount     int64
-}
-
-// NewSinglePerQueryUDPConn creates a per-query UDP conn for a single resolver.
-func NewSinglePerQueryUDPConn(addr *net.UDPAddr) *SinglePerQueryUDPConn {
-	s := &SinglePerQueryUDPConn{
-		addr:    addr,
-		workCh:  make(chan []byte, 256),
-		recvCh:  make(chan udpResponse, 256),
-		closeCh: make(chan struct{}),
-	}
-	s.wg.Add(udpWorkers)
-	for i := 0; i < udpWorkers; i++ {
-		go s.worker()
-	}
-	return s
-}
-
-func (s *SinglePerQueryUDPConn) worker() {
-	defer s.wg.Done()
-	for {
-		select {
-		case payload, ok := <-s.workCh:
-			if !ok {
-				return
-			}
-			s.handleQuery(payload)
-		case <-s.closeCh:
-			return
-		}
-	}
-}
-
-func (s *SinglePerQueryUDPConn) handleQuery(payload []byte) {
-	conn, err := net.DialUDP("udp", nil, s.addr)
-	if err != nil {
-		return
-	}
-	defer conn.Close()
-
-	_, err = conn.Write(payload)
-	if err != nil {
-		return
-	}
-
-	deadline := time.Now().Add(udpReadTimeout)
-	conn.SetReadDeadline(deadline)
-	var buf [4096]byte
-
-	for {
-		n, err := conn.Read(buf[:])
-		if err != nil {
-			return
-		}
-
-		if n >= 4 {
-			rcode := int(buf[3]) & 0x0f
-			switch rcode {
-			case dns.RcodeServerFailure:
-				atomic.AddInt64(&s.forgedSERVFAIL, 1)
-				continue // skip forged injection
-			case dns.RcodeNameError:
-				atomic.AddInt64(&s.forgedNXDOMAIN, 1)
-				continue // skip forged injection
-			case dns.RcodeNoError:
-				atomic.AddInt64(&s.validCount, 1)
-			default:
-				atomic.AddInt64(&s.forgedOther, 1)
-			}
-		}
-
-		resp := udpResponse{
-			data: make([]byte, n),
-			n:    n,
-			addr: s.addr,
-		}
-		copy(resp.data, buf[:n])
-		select {
-		case s.recvCh <- resp:
-		case <-s.closeCh:
-		}
-		return
-	}
-}
-
-func (s *SinglePerQueryUDPConn) WriteTo(p []byte, _ net.Addr) (int, error) {
-	payload := make([]byte, len(p))
-	copy(payload, p)
-	select {
-	case s.workCh <- payload:
-		return len(p), nil
-	case <-s.closeCh:
-		return 0, net.ErrClosed
-	}
-}
-
-func (s *SinglePerQueryUDPConn) ReadFrom(p []byte) (int, net.Addr, error) {
-	select {
-	case resp, ok := <-s.recvCh:
-		if !ok {
-			return 0, nil, net.ErrClosed
-		}
-		return copy(p, resp.data), resp.addr, nil
-	case <-s.closeCh:
-		return 0, nil, net.ErrClosed
-	}
-}
-
-func (s *SinglePerQueryUDPConn) Close() error {
-	s.closeOnce.Do(func() {
-		close(s.closeCh)
-		s.wg.Wait()
-		close(s.recvCh)
-	})
-	return nil
-}
-
-func (s *SinglePerQueryUDPConn) LocalAddr() net.Addr                { return nil }
-func (s *SinglePerQueryUDPConn) SetDeadline(t time.Time) error      { return nil }
-func (s *SinglePerQueryUDPConn) SetReadDeadline(t time.Time) error  { return nil }
-func (s *SinglePerQueryUDPConn) SetWriteDeadline(t time.Time) error { return nil }
-
-// ---------------------------------------------------------------------------
-// AddrNormConn — unchanged
+// AddrNormConn
 // ---------------------------------------------------------------------------
 
 // AddrNormConn wraps a net.PacketConn and overrides ReadFrom to always return
@@ -611,25 +400,32 @@ type recvMsg struct {
 }
 
 // SmartMultiPacketConn multiplexes across multiple net.PacketConn transports
-// (for DoT). It fans out each write to ALL alive transports simultaneously
-// and aggregates reads via a shared channel. KCP deduplicates responses.
+// (for DoT). In fanout mode it sends to ALL alive transports (KCP deduplicates).
+// In round-robin mode it sends to ONE alive transport for bandwidth aggregation.
 type SmartMultiPacketConn struct {
-	transports []net.PacketConn
-	addrs      []net.Addr
-	recvCh     chan recvMsg
-	closeCh    chan struct{}
-	closeOnce  sync.Once
-	recvWg     sync.WaitGroup
-	tracker    *resolverTracker
+	transports  []net.PacketConn
+	addrs       []net.Addr
+	recvCh      chan recvMsg
+	closeCh     chan struct{}
+	closeOnce   sync.Once
+	recvWg      sync.WaitGroup
+	tracker     *resolverTracker
+	mode        ResolverMode
+	spreadCount int // max targets in round-robin mode (default 3)
 }
 
-func NewSmartMultiPacketConn(transports []net.PacketConn, addrs []net.Addr) *SmartMultiPacketConn {
+func NewSmartMultiPacketConn(transports []net.PacketConn, addrs []net.Addr, mode ResolverMode, spreadCount int) *SmartMultiPacketConn {
+	if spreadCount < 1 {
+		spreadCount = 3
+	}
 	m := &SmartMultiPacketConn{
-		transports: transports,
-		addrs:      addrs,
-		recvCh:     make(chan recvMsg, 256),
-		closeCh:    make(chan struct{}),
-		tracker:    newResolverTracker(len(transports)),
+		transports:  transports,
+		addrs:       addrs,
+		recvCh:      make(chan recvMsg, 256),
+		closeCh:     make(chan struct{}),
+		tracker:     newResolverTracker(len(transports)),
+		mode:        mode,
+		spreadCount: spreadCount,
 	}
 	m.recvWg.Add(len(transports))
 	for i, t := range transports {
@@ -667,6 +463,22 @@ func (m *SmartMultiPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
 }
 
 func (m *SmartMultiPacketConn) WriteTo(p []byte, _ net.Addr) (int, error) {
+	if m.mode == ModeRoundRobin {
+		targets := m.tracker.pickSpread(m.spreadCount)
+		m.tracker.markSent(targets[0])
+		n, err := m.transports[targets[0]].WriteTo(p, m.addrs[targets[0]])
+		if err != nil {
+			m.tracker.markDead(targets[0])
+		}
+		for _, idx := range targets[1:] {
+			m.tracker.markSent(idx)
+			if _, sErr := m.transports[idx].WriteTo(p, m.addrs[idx]); sErr != nil {
+				m.tracker.markDead(idx)
+			}
+		}
+		return n, err
+	}
+	// Fanout: send to all alive transports.
 	targets := m.tracker.pickAlive()
 	var lastN int
 	var lastErr error
