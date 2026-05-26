@@ -1,2 +1,5 @@
 /noizdns-server
 .DS_Store
+
+/noizdns-client
+/cmd/noizdns-server/noizdns-server
