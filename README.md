@@ -203,4 +203,6 @@ noizdns-server -privkey-file server.key -mtu 1232 t.example.com
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+Copyright (c) 2024-2026 SlipNet Contributors
+
+Licensed under the GNU Affero General Public License v3.0 — see [LICENSE](LICENSE).
